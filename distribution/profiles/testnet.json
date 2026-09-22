@@ -1,0 +1,12 @@
+{
+  "network": "testnet",
+  "ready": false,
+  "reason": "RC2 public deployment and pilot acceptance pending",
+  "chainId": 46630,
+  "rpcUrl": "https://rpc.testnet.chain.robinhood.com",
+  "miningCore": null,
+  "basket": null,
+  "coreCodeSha256": null,
+  "basketCodeSha256": null,
+  "binarySha256": null
+}

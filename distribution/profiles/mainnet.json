@@ -1,0 +1,12 @@
+{
+  "network": "mainnet",
+  "ready": false,
+  "reason": "Mainnet deployment not approved or configured",
+  "chainId": null,
+  "rpcUrl": null,
+  "miningCore": null,
+  "basket": null,
+  "coreCodeSha256": null,
+  "basketCodeSha256": null,
+  "binarySha256": null
+}

@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -15,10 +16,11 @@ use zeroize::Zeroizing;
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-const MINING_CORE: &str = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+mod common;
+const MINING_CORE: &str = common::MINING_CORE;
 const CHAIN_ID: &str = "31337";
 const SUBMISSION_WARNING: &str = "Another miner may consume this challenge before inclusion, and this transaction may fail. Receipt success is accepted only after transaction and event consistency checks; the configured RPC can still withhold or delay data and remains a trust source.";
-const PROOF_HUNTER_FEE_WARNING: &str = "An accepted Proof Hunter win pays zero liquid HUNTER because the whole reward locks inside the Hunter. It costs materially more than an ordinary proof; --max-fee must cover that larger transaction or the miner will refuse and forfeit the whole reward.";
+const PROOF_HUNTER_FEE_WARNING: &str = "Every accepted HunterMiningCore proof mints one NFT and pays no liquid HUNTER. Token activation and backing are separate from mining; no backing amount is promised. --max-fee must cover the estimated mint transaction or submission is refused.";
 
 #[test]
 fn submit_requires_an_explicit_total_fee_ceiling() {
@@ -80,12 +82,12 @@ fn help_documents_submission_exit_codes_and_explicit_nonce_names() {
     assert!(submit.contains("--mining-nonce"));
     assert!(submit.contains("--max-fee"));
     assert!(submit.contains("mandatory and has no default"));
-    assert!(submit.contains("zero liquid HUNTER"));
-    assert!(submit.contains("forfeit that whole reward"));
+    assert!(submit.contains("no liquid token reward"));
+    assert!(submit.contains("estimated mint transaction"));
     assert!(mine.contains("--submit"));
     assert!(mine.contains("--max-fee"));
-    assert!(mine.contains("zero liquid HUNTER"));
-    assert!(mine.contains("forfeit that whole reward"));
+    assert!(mine.contains("no liquid token reward"));
+    assert!(mine.contains("estimated mint transaction"));
 }
 
 #[test]
@@ -125,7 +127,9 @@ fn live_anvil_mines_and_submits_one_real_proof() {
         json!(["0x00000000000000000000000000000000000ba5e7", "0x00"]),
     );
     deploy_launch_set(&endpoint, &directory);
-    rpc(&endpoint, "anvil_mine", json!(["0x4"]));
+    // RC2 uses a 64-block auto-seed margin; advance beyond it before the
+    // first fee/submit rehearsal.
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
 
     let keystore = directory.join("mining-wallet.json");
     let recovery_file = directory.join("mining-wallet-recovery.txt");
@@ -149,13 +153,16 @@ fn live_anvil_mines_and_submits_one_real_proof() {
     assert!(wallet_stderr.is_empty());
     let wallet: Value = serde_json::from_slice(wallet_stdout.as_slice()).unwrap();
     let miner = wallet["address"].as_str().unwrap().to_owned();
-    rpc(
-        &endpoint,
-        "anvil_setBalance",
-        json!([miner, "0xde0b6b3a7640000"]),
-    );
+    // Fund the new wallet through an actual transfer, as an external wallet does.
+    let accounts = rpc(&endpoint, "eth_accounts", json!([]));
+    let funding_hash = rpc(&endpoint, "eth_sendTransaction", json!([{
+        "from": accounts[0], "to": miner, "value": "0xde0b6b3a7640000"
+    }]));
+    let funding_receipt = rpc(&endpoint, "eth_getTransactionReceipt", json!([funding_hash]));
+    assert_eq!(funding_receipt["status"], "0x1");
+    assert_eq!(rpc(&endpoint, "eth_getBalance", json!([miner, "latest"])), "0xde0b6b3a7640000");
 
-    let project_token = mining_core_child_address(&endpoint, "PROJECT_TOKEN()");
+    let project_token = mining_core_child_address(&endpoint, "PROOF_NFT()");
     let reward_before = token_balance(&endpoint, &project_token, &miner);
     let challenge_before = mining_core_word(&endpoint, "activeChallengeId()");
     let account_nonce_before = account_transaction_count(&endpoint, &miner);
@@ -204,7 +211,7 @@ fn live_anvil_mines_and_submits_one_real_proof() {
     );
     assert!(matches!(
         refused["proofClassification"].as_str(),
-        Some("ordinary" | "proofHunter")
+        Some("proofHunter")
     ));
     assert!(
         refused["reason"]
@@ -260,12 +267,12 @@ fn live_anvil_mines_and_submits_one_real_proof() {
         decimal(&submitted["maxFeePerGasWei"]),
         base_fee_per_gas * 2 + priority_fee_per_gas
     );
-    assert_eq!(submitted["gasMarginPercent"], "25");
+    assert_eq!(submitted["gasMarginPercent"], "100");
     assert_eq!(submitted["stateSource"], "chain");
     assert_eq!(submitted["warning"], SUBMISSION_WARNING);
     assert!(matches!(
         submitted["proofClassification"].as_str(),
-        Some("ordinary" | "proofHunter")
+        Some("proofHunter")
     ));
     assert!(decimal(&submitted["feePaidWei"]) > 0);
     assert!(decimal(&submitted["feePaidWei"]) <= decimal(&submitted["maximumExposureWei"]));
@@ -283,6 +290,7 @@ fn live_anvil_mines_and_submits_one_real_proof() {
             "maximumExposureWei",
             "miner",
             "miningNonce",
+            "nftTokenId",
             "priorityFeePerGasWei",
             "proofClassification",
             "stateSource",
@@ -298,7 +306,136 @@ fn live_anvil_mines_and_submits_one_real_proof() {
     assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 2);
     assert!(token_balance(&endpoint, &project_token, &miner) > reward_before);
     assert_eq!(account_transaction_count(&endpoint, &miner), 1);
-    println!("live Anvil submission transaction hash: {transaction_hash}");
+    assert_eq!(submitted["nftTokenId"], "1");
+    let owner_call = format!("{}{:064x}", selector("ownerOf(uint256)"), 1);
+    let owner = eth_call(&endpoint, &project_token, owner_call);
+    assert_eq!(&owner.as_str().unwrap()[26..], &miner[2..]);
+    // A new CLI process restores the same encrypted wallet and uses the next
+    // on-chain account nonce, rather than replaying the already-mined proof.
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
+    let restarted = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&restarted, passphrase.as_bytes());
+    assert_eq!(
+        restarted.status.code(),
+        Some(0),
+        "{}",
+        format_args!(
+            "{} {}",
+            String::from_utf8_lossy(&restarted.stderr),
+            String::from_utf8_lossy(&restarted.stdout)
+        )
+    );
+    let restarted: Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    assert_eq!(restarted["accountNonce"], "1");
+    assert_eq!(restarted["nftTokenId"], "2");
+    assert_eq!(token_balance(&endpoint, &project_token, &miner), 2);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 2);
+    println!("live Anvil submission and restarted wallet verified: {transaction_hash}");
+}
+
+#[test]
+fn lost_send_reply_recovers_exact_signed_transaction_before_new_mining() {
+    if !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../contracts")
+        .exists()
+    {
+        report_live_skip("the monorepo contracts tree is unavailable in this checkout");
+        return;
+    }
+    if Command::new("anvil").arg("--version").output().is_err() {
+        report_live_skip("`anvil` is unavailable");
+        return;
+    }
+
+    disable_core_dumps_for_children();
+    let port = unused_local_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let directory = temp_directory(port);
+    let mut anvil = AnvilGuard::start(port, directory.clone());
+    wait_for_anvil(&endpoint, &mut anvil.child);
+    rpc(
+        &endpoint,
+        "anvil_setCode",
+        json!(["0x00000000000000000000000000000000000ba5e7", "0x00"]),
+    );
+    deploy_launch_set(&endpoint, &directory);
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
+
+    let keystore = directory.join("recovery-wallet.json");
+    let recovery_file = directory.join("recovery-wallet-phrase.txt");
+    let passphrase_file = directory.join("recovery-passphrase");
+    let passphrase = runtime_secret();
+    write_owner_only(&passphrase_file, passphrase.as_bytes());
+    let created = run([
+        "wallet",
+        "new",
+        "--keystore",
+        keystore.to_str().unwrap(),
+        "--recovery-out",
+        recovery_file.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase_file.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(created.status.code(), Some(0));
+    let wallet: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let miner = wallet["address"].as_str().unwrap();
+    rpc(
+        &endpoint,
+        "anvil_setBalance",
+        json!([miner, "0xde0b6b3a7640000"]),
+    );
+
+    let proxy = LostSendReplyProxy::start(endpoint.clone());
+    let first = run(mine_submit_args(
+        &proxy.endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&first, passphrase.as_bytes());
+    assert_eq!(first.status.code(), Some(2));
+    let first_error = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_error.contains("durable recovery journal retained"),
+        "{first_error}"
+    );
+    let pending = keystore.with_file_name("recovery-wallet.json.pending-submission.json");
+    assert!(pending.exists());
+    assert_eq!(account_transaction_count(&endpoint, miner), 1);
+
+    let recovered = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&recovered, passphrase.as_bytes());
+    assert_eq!(
+        recovered.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["accountNonce"], "0");
+    assert_eq!(recovered["nftTokenId"], "1");
+    assert_eq!(account_transaction_count(&endpoint, miner), 1);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 1);
+    assert!(!pending.exists());
+    drop(proxy);
 }
 
 fn mine_submit_args(
@@ -318,6 +455,8 @@ fn mine_submit_args(
         chain_id.to_owned(),
         "--mining-core".to_owned(),
         MINING_CORE.to_owned(),
+        "--basket".to_owned(),
+        common::BASKET.to_owned(),
         "--keystore".to_owned(),
         keystore.display().to_string(),
         "--passphrase-file".to_owned(),
@@ -342,31 +481,7 @@ fn mine_submit_args(
 }
 
 fn deploy_launch_set(endpoint: &str, directory: &Path) {
-    let contracts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../contracts");
-    let deployment = Command::new("forge")
-        .current_dir(contracts_dir)
-        .env(
-            "LAUNCH_CONFIG_PATH",
-            "config/deploy-launch.example.fake.json",
-        )
-        .env("FOUNDRY_BROADCAST", directory.join("broadcast"))
-        .env("FOUNDRY_CACHE_PATH", directory.join("forge-cache"))
-        .args([
-            "script",
-            "script/DeployLaunchSet.s.sol:DeployLaunchSet",
-            "--rpc-url",
-            endpoint,
-            "--broadcast",
-            "--unlocked",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        deployment.status.success(),
-        "launch deployment failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&deployment.stdout),
-        String::from_utf8_lossy(&deployment.stderr)
-    );
+    common::deploy(endpoint, directory);
 }
 
 fn mining_core_child_address(endpoint: &str, signature: &str) -> String {
@@ -551,6 +666,106 @@ fn report_live_skip(reason: &str) {
 struct AnvilGuard {
     child: Child,
     directory: PathBuf,
+}
+
+struct LostSendReplyProxy {
+    endpoint: String,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl LostSendReplyProxy {
+    fn start(upstream: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let dropped = AtomicBool::new(false);
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("lost-reply proxy accept failed: {error}"),
+                };
+                // macOS can propagate O_NONBLOCK from the listener to an
+                // accepted socket. The proxy reads one complete HTTP request,
+                // so make that accepted connection explicitly blocking.
+                stream.set_nonblocking(false).unwrap();
+                let body = read_http_request_body(&mut stream);
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let is_send = request["method"] == "eth_sendRawTransaction";
+                let mut response = ureq::post(&upstream)
+                    .header("content-type", "application/json")
+                    .send(body.as_slice())
+                    .unwrap();
+                let response_body = response.body_mut().read_to_string().unwrap();
+                if is_send && !dropped.swap(true, Ordering::AcqRel) {
+                    drop(stream);
+                    continue;
+                }
+                write_http_response(&mut stream, &response_body);
+            }
+        });
+        Self {
+            endpoint,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LostSendReplyProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            // Never create a second panic from a test-fixture destructor. A
+            // proxy thread failure already causes the transaction assertions
+            // in the owning test to fail with the useful chain evidence.
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_http_request_body(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 8_192];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0);
+        request.extend_from_slice(&buffer[..read]);
+        let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..start]).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        break (start + 4, length);
+    };
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0);
+        request.extend_from_slice(&buffer[..read]);
+    }
+    request[header_end..header_end + content_length].to_vec()
+}
+
+fn write_http_response(stream: &mut TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
 
 impl AnvilGuard {

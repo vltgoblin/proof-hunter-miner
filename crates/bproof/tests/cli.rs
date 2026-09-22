@@ -314,7 +314,8 @@ fn status_from_sample_file_has_exact_state_reward_and_source_fields() {
             "divisor": divisor.to_string(),
             "rewardWei": reward.to_string(),
             "reserveWei": reserve.to_string(),
-            "stateSource": "file"
+            "stateSource": "file",
+            "settlementMode": "legacyOfflineSchedule"
         })
     );
     assert_exact_keys(
@@ -331,6 +332,7 @@ fn status_from_sample_file_has_exact_state_reward_and_source_fields() {
             "seedBlockhash",
             "seedParentBlock",
             "stateSource",
+            "settlementMode",
             "target",
             "totalMintedWei",
         ],
@@ -474,7 +476,10 @@ fn live_status_and_mine_are_always_labelled_chain_while_file_stays_file() {
     let live_status_value = parse_single_json_line(&live_status);
     assert_eq!(live_status_value["stateSource"], "chain");
     assert_eq!(live_status_value["acceptedProofs"], "0");
-    assert_eq!(live_status_value["totalMintedWei"], "0");
+    assert_eq!(live_status_value["nftsMintedEver"], "0");
+    assert_eq!(live_status_value["settlementMode"], "nftOnly");
+    assert!(live_status_value.get("rewardWei").is_none());
+    assert!(live_status_value.get("totalMintedWei").is_none());
     assert_eq!(
         live_status_value["target"],
         "0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"

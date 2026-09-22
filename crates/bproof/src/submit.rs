@@ -1,5 +1,8 @@
 //! Live JSON-RPC preparation and single-shot submission of one proof.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,18 +11,22 @@ use bproof::transaction::{Eip1559Transaction, sign_eip1559_transaction, submit_p
 use proof_core::{
     Address, Digest, ProofInputs, Uint256, derive_challenge, keccak256, proof_digest,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chain::RpcChainReader;
 use crate::parse::{
-    hex_string, parse_address, parse_digest, parse_hex_quantity_uint256, parse_uint256_word,
+    hex_string, parse_address, parse_decimal_uint256, parse_digest, parse_hex_bytes,
+    parse_hex_quantity_uint256, parse_u64, parse_u128, parse_uint256_word, uint256_to_decimal,
 };
 
 pub const FEE_REFUSAL_EXIT_CODE: u8 = 3;
 pub const SUBMISSION_WARNING: &str = "Another miner may consume this challenge before inclusion, and this transaction may fail. Receipt success is accepted only after transaction and event consistency checks; the configured RPC can still withhold or delay data and remains a trust source.";
-pub const PROOF_HUNTER_FEE_WARNING: &str = "An accepted Proof Hunter win pays zero liquid HUNTER because the whole reward locks inside the Hunter. It costs materially more than an ordinary proof; --max-fee must cover that larger transaction or the miner will refuse and forfeit the whole reward.";
+pub const PROOF_HUNTER_FEE_WARNING: &str = "Every accepted HunterMiningCore proof mints one NFT and pays no liquid HUNTER. Token activation and backing are separate from mining; no backing amount is promised. --max-fee must cover the estimated mint transaction or submission is refused.";
 
-const DEFAULT_GAS_MARGIN_PERCENT: u64 = 25;
+// NFT composition can use more gas at inclusion than the RPC estimate.
+// The explicit total fee ceiling still bounds the padded exposure.
+const DEFAULT_GAS_MARGIN_PERCENT: u64 = 100;
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -59,6 +66,7 @@ pub struct PreparedSubmission {
     seed_parent_block: Uint256,
     challenge: Digest,
     expected_digest: Digest,
+    basket: Address,
     transaction: Eip1559Transaction,
 }
 
@@ -95,13 +103,55 @@ pub struct MinedSubmission {
     pub fee_paid_wei: u128,
     pub succeeded: bool,
     pub proof_nft_minted: bool,
+    pub nft_token_id: Option<Uint256>,
 }
+
+#[derive(Debug)]
+pub struct RecoveredSubmission {
+    pub mined: MinedSubmission,
+    pub miner: Address,
+    pub proof_classification: String,
+    pub classification_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingSubmissionDocument {
+    version: u8,
+    transaction_hash: String,
+    raw_transaction: String,
+    mining_nonce: String,
+    account_nonce: String,
+    miner: String,
+    challenge_id: String,
+    seed_parent_block: String,
+    challenge: String,
+    expected_digest: String,
+    basket: String,
+    chain_id: String,
+    max_priority_fee_per_gas: String,
+    max_fee_per_gas: String,
+    gas_limit: String,
+    to: String,
+    data: String,
+    base_fee_per_gas_wei: String,
+    priority_fee_per_gas_wei: String,
+    estimated_gas: String,
+    gas_margin_percent: String,
+    maximum_exposure_wei: String,
+    fee_ceiling_wei: String,
+    proof_classification: String,
+    classification_reason: Option<String>,
+}
+
+const PENDING_SUBMISSION_VERSION: u8 = 1;
 
 pub fn prepare_submission(
     reader: &RpcChainReader,
     challenge_inputs: proof_core::ChallengeInputs,
     miner: Address,
     mining_nonce: Uint256,
+    basket: Address,
     fee_options: FeeOptions,
 ) -> Result<PreparationOutcome, String> {
     let challenge = derive_challenge(&challenge_inputs);
@@ -117,6 +167,7 @@ pub fn prepare_submission(
         challenge_inputs.challenge_id,
         challenge_inputs.seed_parent_block,
         mining_nonce,
+        basket,
     );
     let call = transaction_call(miner, challenge_inputs.mining_core, &call_data);
 
@@ -186,14 +237,74 @@ pub fn prepare_submission(
         seed_parent_block: challenge_inputs.seed_parent_block,
         challenge,
         expected_digest,
+        basket,
         transaction,
     })))
+}
+
+#[must_use]
+pub fn pending_submission_path(keystore: &Path) -> PathBuf {
+    let mut name = keystore
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_else(|| "wallet".into());
+    name.push(".pending-submission.json");
+    keystore.with_file_name(name)
+}
+
+pub fn recover_pending_submission(
+    reader: &RpcChainReader,
+    keystore: &Path,
+) -> Result<Option<RecoveredSubmission>, String> {
+    let journal_path = pending_submission_path(keystore);
+    if !journal_path.exists() {
+        return Ok(None);
+    }
+    let document = read_pending_document(&journal_path)?;
+    let (expected_hash, raw_transaction, prepared) = document.to_prepared()?;
+    if keccak256(&raw_transaction) != expected_hash {
+        return Err(format!(
+            "pending submission journal {} does not match its signed transaction hash; refusing to send or replace it",
+            journal_path.display()
+        ));
+    }
+
+    let hash_text = hex_string(&expected_hash.to_bytes());
+    let existing = reader.rpc_result(
+        "pending proof transaction receipt",
+        "eth_getTransactionReceipt",
+        json!([&hash_text]),
+    )?;
+    let receipt = if existing.is_null() {
+        // Re-broadcasting the exact signed bytes is idempotent. Any RPC error
+        // remains ambiguous, so receipt lookup below is still authoritative.
+        let _ = reader.string_result(
+            "pending signed proof rebroadcast",
+            "eth_sendRawTransaction",
+            json!([hex_string(&raw_transaction)]),
+        );
+        wait_for_receipt(reader, expected_hash, &prepared)?
+    } else {
+        parse_receipt(&existing, expected_hash, &prepared)?
+    };
+    verify_mined_transaction(reader, expected_hash, &receipt, &prepared)?;
+    let mined = mined_submission(expected_hash, &receipt, &prepared)?;
+    clear_pending_document(&journal_path)?;
+    Ok(Some(RecoveredSubmission {
+        mined,
+        miner: prepared.miner,
+        proof_classification: document.proof_classification,
+        classification_reason: document.classification_reason,
+    }))
 }
 
 pub fn send_prepared_submission(
     reader: &RpcChainReader,
     wallet: &UnlockedWallet,
     prepared: PreparedSubmission,
+    keystore: &Path,
+    proof_classification: &str,
+    classification_reason: Option<&str>,
 ) -> Result<MinedSubmission, String> {
     if parse_address(wallet.address(), "unlocked wallet address")? != prepared.miner {
         return Err("unlocked wallet does not match the prepared proof miner".to_owned());
@@ -201,24 +312,182 @@ pub fn send_prepared_submission(
     let signed = sign_eip1559_transaction(wallet, &prepared.transaction)?;
     let expected_transaction_hash = signed.transaction_hash();
     let raw_transaction = hex_string(signed.raw_bytes());
-    let sent_hash_text = reader
-        .string_result(
-            "signed proof submission",
-            "eth_sendRawTransaction",
-            json!([raw_transaction]),
-        )
-        .map_err(|error| disambiguate_account_nonce(&error))?;
-    let sent_hash = parse_digest(&sent_hash_text, "eth_sendRawTransaction transaction hash")?;
-    if sent_hash != expected_transaction_hash {
-        return Err(format!(
-            "eth_sendRawTransaction returned transaction hash {}, but the signed transaction hash is {}",
-            hex_string(&sent_hash.to_bytes()),
-            hex_string(&expected_transaction_hash.to_bytes())
-        ));
+    let journal_path = pending_submission_path(keystore);
+    let journal = PendingSubmissionDocument::from_prepared(
+        expected_transaction_hash,
+        &raw_transaction,
+        &prepared,
+        proof_classification,
+        classification_reason,
+    );
+    persist_pending_document(&journal_path, &journal)?;
+    let outcome = (|| -> Result<MinedSubmission, String> {
+        let sent_hash_text = reader
+            .string_result(
+                "signed proof submission",
+                "eth_sendRawTransaction",
+                json!([raw_transaction]),
+            )
+            .map_err(|error| disambiguate_account_nonce(&error))?;
+        let sent_hash = parse_digest(&sent_hash_text, "eth_sendRawTransaction transaction hash")?;
+        if sent_hash != expected_transaction_hash {
+            return Err(format!(
+                "eth_sendRawTransaction returned transaction hash {}, but the signed transaction hash is {}",
+                hex_string(&sent_hash.to_bytes()),
+                hex_string(&expected_transaction_hash.to_bytes())
+            ));
+        }
+
+        let receipt = wait_for_receipt(reader, sent_hash, &prepared)?;
+        verify_mined_transaction(reader, sent_hash, &receipt, &prepared)?;
+        mined_submission(sent_hash, &receipt, &prepared)
+    })();
+    match outcome {
+        Ok(mined) => {
+            clear_pending_document(&journal_path)?;
+            Ok(mined)
+        }
+        Err(error) => Err(format!(
+            "submission outcome unresolved for signed transaction {}; durable recovery journal retained at {}; rerun with the same keystore to reconcile the exact signed transaction before any new proof is sent: {error}",
+            hex_string(&expected_transaction_hash.to_bytes()),
+            journal_path.display()
+        )),
+    }
+}
+
+impl PendingSubmissionDocument {
+    fn from_prepared(
+        transaction_hash: Digest,
+        raw_transaction: &str,
+        prepared: &PreparedSubmission,
+        proof_classification: &str,
+        classification_reason: Option<&str>,
+    ) -> Self {
+        let fee = prepared.fee_quote;
+        let tx = &prepared.transaction;
+        Self {
+            version: PENDING_SUBMISSION_VERSION,
+            transaction_hash: hex_string(&transaction_hash.to_bytes()),
+            raw_transaction: raw_transaction.to_owned(),
+            mining_nonce: uint256_to_decimal(prepared.mining_nonce),
+            account_nonce: uint256_to_decimal(prepared.account_nonce),
+            miner: hex_string(&prepared.miner.to_bytes()),
+            challenge_id: uint256_to_decimal(prepared.challenge_id),
+            seed_parent_block: uint256_to_decimal(prepared.seed_parent_block),
+            challenge: hex_string(&prepared.challenge.to_bytes()),
+            expected_digest: hex_string(&prepared.expected_digest.to_bytes()),
+            basket: hex_string(&prepared.basket.to_bytes()),
+            chain_id: uint256_to_decimal(tx.chain_id),
+            max_priority_fee_per_gas: uint256_to_decimal(tx.max_priority_fee_per_gas),
+            max_fee_per_gas: uint256_to_decimal(tx.max_fee_per_gas),
+            gas_limit: uint256_to_decimal(tx.gas_limit),
+            to: hex_string(&tx.to.to_bytes()),
+            data: hex_string(&tx.data),
+            base_fee_per_gas_wei: fee.base_fee_per_gas_wei.to_string(),
+            priority_fee_per_gas_wei: fee.priority_fee_per_gas_wei.to_string(),
+            estimated_gas: fee.estimated_gas.to_string(),
+            gas_margin_percent: fee.gas_margin_percent.to_string(),
+            maximum_exposure_wei: fee.maximum_exposure_wei.to_string(),
+            fee_ceiling_wei: fee.fee_ceiling_wei.to_string(),
+            proof_classification: proof_classification.to_owned(),
+            classification_reason: classification_reason.map(str::to_owned),
+        }
     }
 
-    let receipt = wait_for_receipt(reader, sent_hash, &prepared)?;
-    verify_mined_transaction(reader, sent_hash, &receipt, &prepared)?;
+    fn to_prepared(&self) -> Result<(Digest, Vec<u8>, PreparedSubmission), String> {
+        if self.version != PENDING_SUBMISSION_VERSION {
+            return Err(format!(
+                "unsupported pending submission journal version {}",
+                self.version
+            ));
+        }
+        let transaction_hash = parse_digest(&self.transaction_hash, "journal transactionHash")?;
+        let raw_transaction = parse_hex_bytes(&self.raw_transaction, "journal rawTransaction")?;
+        let fee_quote = FeeQuote {
+            base_fee_per_gas_wei: parse_u128(
+                &self.base_fee_per_gas_wei,
+                "journal baseFeePerGasWei",
+            )?,
+            priority_fee_per_gas_wei: parse_u128(
+                &self.priority_fee_per_gas_wei,
+                "journal priorityFeePerGasWei",
+            )?,
+            max_fee_per_gas_wei: parse_u128(&self.max_fee_per_gas, "journal maxFeePerGas")?,
+            estimated_gas: parse_u64(&self.estimated_gas, "journal estimatedGas")?,
+            gas_margin_percent: parse_u64(&self.gas_margin_percent, "journal gasMarginPercent")?,
+            gas_limit: parse_u64(&self.gas_limit, "journal gasLimit")?,
+            maximum_exposure_wei: parse_u128(
+                &self.maximum_exposure_wei,
+                "journal maximumExposureWei",
+            )?,
+            fee_ceiling_wei: parse_u128(&self.fee_ceiling_wei, "journal feeCeilingWei")?,
+        };
+        let prepared = PreparedSubmission {
+            mining_nonce: parse_decimal_uint256(&self.mining_nonce, "journal miningNonce")?,
+            account_nonce: parse_decimal_uint256(&self.account_nonce, "journal accountNonce")?,
+            fee_quote,
+            miner: parse_address(&self.miner, "journal miner")?,
+            challenge_id: parse_decimal_uint256(&self.challenge_id, "journal challengeId")?,
+            seed_parent_block: parse_decimal_uint256(
+                &self.seed_parent_block,
+                "journal seedParentBlock",
+            )?,
+            challenge: parse_digest(&self.challenge, "journal challenge")?,
+            expected_digest: parse_digest(&self.expected_digest, "journal expectedDigest")?,
+            basket: parse_address(&self.basket, "journal basket")?,
+            transaction: Eip1559Transaction {
+                chain_id: parse_decimal_uint256(&self.chain_id, "journal chainId")?,
+                account_nonce: parse_decimal_uint256(&self.account_nonce, "journal accountNonce")?,
+                max_priority_fee_per_gas: parse_decimal_uint256(
+                    &self.max_priority_fee_per_gas,
+                    "journal maxPriorityFeePerGas",
+                )?,
+                max_fee_per_gas: parse_decimal_uint256(
+                    &self.max_fee_per_gas,
+                    "journal maxFeePerGas",
+                )?,
+                gas_limit: parse_decimal_uint256(&self.gas_limit, "journal gasLimit")?,
+                to: parse_address(&self.to, "journal to")?,
+                data: parse_hex_bytes(&self.data, "journal data")?,
+            },
+        };
+        if prepared.transaction.account_nonce != prepared.account_nonce {
+            return Err(
+                "pending submission journal contains inconsistent account nonces".to_owned(),
+            );
+        }
+        if prepared.transaction.max_fee_per_gas != Uint256::from(fee_quote.max_fee_per_gas_wei)
+            || prepared.transaction.max_priority_fee_per_gas
+                != Uint256::from(fee_quote.priority_fee_per_gas_wei)
+            || prepared.transaction.gas_limit != Uint256::from(fee_quote.gas_limit)
+        {
+            return Err("pending submission journal contains inconsistent fee fields".to_owned());
+        }
+        let expected_gas_limit =
+            padded_gas_limit(fee_quote.estimated_gas, fee_quote.gas_margin_percent)?;
+        let expected_exposure = u128::from(fee_quote.gas_limit)
+            .checked_mul(fee_quote.max_fee_per_gas_wei)
+            .ok_or_else(|| {
+                "pending submission journal fee exposure exceeds the u128 range".to_owned()
+            })?;
+        if expected_gas_limit != fee_quote.gas_limit
+            || expected_exposure != fee_quote.maximum_exposure_wei
+            || fee_quote.maximum_exposure_wei > fee_quote.fee_ceiling_wei
+        {
+            return Err(
+                "pending submission journal contains an inconsistent or unauthorised fee exposure"
+                    .to_owned(),
+            );
+        }
+        Ok((transaction_hash, raw_transaction, prepared))
+    }
+}
+
+fn mined_submission(
+    transaction_hash: Digest,
+    receipt: &TransactionReceipt,
+    prepared: &PreparedSubmission,
+) -> Result<MinedSubmission, String> {
     let fee_paid_wei = receipt
         .gas_used
         .checked_mul(receipt.effective_gas_price_wei)
@@ -230,14 +499,162 @@ pub fn send_prepared_submission(
         ));
     }
     Ok(MinedSubmission {
-        transaction_hash: sent_hash,
+        transaction_hash,
         mining_nonce: prepared.mining_nonce,
         account_nonce: prepared.account_nonce,
         fee_quote: prepared.fee_quote,
         fee_paid_wei,
         succeeded: receipt.succeeded,
         proof_nft_minted: receipt.proof_nft_minted,
+        nft_token_id: receipt.nft_token_id,
     })
+}
+
+fn persist_pending_document(
+    path: &Path,
+    document: &PendingSubmissionDocument,
+) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "pending submission journal {} already exists; reconcile it before signing a new transaction",
+            path.display()
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "pending submission journal path is not valid UTF-8".to_owned())?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let encoded = serde_json::to_vec_pretty(document)
+        .map_err(|error| format!("failed to encode pending submission journal: {error}"))?;
+    let write_result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| {
+            format!(
+                "failed to create pending submission journal {}: {error}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(&encoded).map_err(|error| {
+            format!(
+                "failed to write pending submission journal {}: {error}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("failed to finish pending submission journal: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("failed to sync pending submission journal: {error}"))?;
+        fs::hard_link(&temporary, path).map_err(|error| {
+            format!(
+                "failed to publish pending submission journal {} without overwriting existing state: {error}",
+                path.display()
+            )
+        })?;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    write_result
+}
+
+fn read_pending_document(path: &Path) -> Result<PendingSubmissionDocument, String> {
+    let mut file = open_owner_only(path)?;
+    let mut encoded = Vec::new();
+    file.read_to_end(&mut encoded).map_err(|error| {
+        format!(
+            "failed to read pending submission journal {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&encoded).map_err(|error| {
+        format!(
+            "pending submission journal {} is invalid; refusing to send a replacement transaction: {error}",
+            path.display()
+        )
+    })
+}
+
+fn clear_pending_document(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(path.parent().unwrap_or_else(|| Path::new("."))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "transaction resolved but failed to remove pending submission journal {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn open_owner_only(path: &Path) -> Result<File, String> {
+    #[cfg(unix)]
+    let file: File = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            format!(
+                "failed to securely open pending submission journal {}: {error}",
+                path.display()
+            )
+        })?
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().read(true).open(path).map_err(|error| {
+        format!(
+            "failed to open pending submission journal {}: {error}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect pending submission journal {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err("pending submission journal must be a regular file".to_owned());
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "pending submission journal {} must be owner-only (mode 0600)",
+                path.display()
+            ));
+        }
+        if metadata.uid() != rustix::process::getuid().as_raw() {
+            return Err(format!(
+                "pending submission journal {} is not owned by the current user",
+                path.display()
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to sync journal directory {}: {error}",
+                path.display()
+            )
+        })
 }
 
 fn transaction_call(from: Address, to: Address, data: &[u8]) -> Value {
@@ -334,6 +751,7 @@ struct TransactionReceipt {
     gas_used: u128,
     effective_gas_price_wei: u128,
     proof_nft_minted: bool,
+    nft_token_id: Option<Uint256>,
     block_hash: Digest,
     block_number: Uint256,
 }
@@ -393,13 +811,18 @@ fn parse_receipt(
     if succeeded {
         verify_proof_accepted_event(logs, transaction_hash, block_hash, block_number, prepared)?;
     }
-    let proof_nft_minted =
+    let nft_token_id =
         verify_proof_nft_event(logs, transaction_hash, block_hash, block_number, prepared)?;
+    let proof_nft_minted = nft_token_id.is_some();
+    if succeeded != proof_nft_minted {
+        return Err("HunterMiningCore success requires exactly one NFT mint; reverted receipts must not mint".to_owned());
+    }
     Ok(TransactionReceipt {
         succeeded,
         gas_used,
         effective_gas_price_wei,
         proof_nft_minted,
+        nft_token_id,
         block_hash,
         block_number,
     })
@@ -484,7 +907,7 @@ fn verify_proof_accepted_event(
     prepared: &PreparedSubmission,
 ) -> Result<(), String> {
     let signature = event_signature(
-        b"ProofAccepted(address,uint256,bytes32,uint256,bytes32,uint256,uint256,uint256,uint256,uint256,uint256,bool)",
+        b"ProofAccepted(address,uint256,bytes32,uint256,bytes32,uint256,uint256,uint256,uint256,uint256,bool)",
     );
     let candidates = event_candidates(logs, signature)?;
     if candidates.len() != 1 {
@@ -510,7 +933,7 @@ fn verify_proof_accepted_event(
         prepared.challenge_id,
     )?;
     require_topic_digest(topics, 3, "ProofAccepted digest", prepared.expected_digest)?;
-    let words = event_data_words(fields, "ProofAccepted", 9)?;
+    let words = event_data_words(fields, "ProofAccepted", 8)?;
     require_word_uint256(
         &words,
         0,
@@ -532,13 +955,12 @@ fn verify_proof_nft_event(
     block_hash: Digest,
     block_number: Uint256,
     prepared: &PreparedSubmission,
-) -> Result<bool, String> {
-    let signature = event_signature(
-        b"ProofNftMinted(address,uint256,uint256,bytes32,uint8,uint256,uint256,uint256)",
-    );
+) -> Result<Option<Uint256>, String> {
+    let signature =
+        event_signature(b"ProofNftMinted(address,uint256,uint256,bytes32,uint8,address)");
     let candidates = event_candidates(logs, signature)?;
     if candidates.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     if candidates.len() != 1 {
         return Err(format!(
@@ -562,9 +984,28 @@ fn verify_proof_nft_event(
         "ProofNftMinted challengeId",
         prepared.challenge_id,
     )?;
-    let words = event_data_words(fields, "ProofNftMinted", 5)?;
+    let words = event_data_words(fields, "ProofNftMinted", 3)?;
     require_word_digest(&words, 0, "ProofNftMinted digest", prepared.expected_digest)?;
-    Ok(true)
+    let mut basket_word = [0_u8; 32];
+    basket_word[12..].copy_from_slice(&prepared.basket.to_bytes());
+    require_word_uint256(
+        &words,
+        2,
+        "ProofNftMinted basket",
+        Uint256::from_be_bytes(basket_word),
+    )?;
+    let tier = parse_uint256_word(&words[1], "ProofNftMinted tier")?;
+    if tier < Uint256::ONE || tier > Uint256::from(4_u64) {
+        return Err("ProofNftMinted tier is outside the NFT tier range".to_owned());
+    }
+    let token_id = parse_uint256_word(
+        topics[2].as_str().ok_or("NFT token ID must be a word")?,
+        "NFT token ID",
+    )?;
+    if token_id == Uint256::ZERO {
+        return Err("ProofNftMinted token ID must be nonzero".to_owned());
+    }
+    Ok(Some(token_id))
 }
 
 fn event_candidates(logs: &[Value], signature: Digest) -> Result<Vec<&Value>, String> {
@@ -865,6 +1306,7 @@ fn disambiguate_account_nonce(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -872,6 +1314,110 @@ mod tests {
     use proof_core::{ChallengeInputs, Target, derive_challenge};
 
     use super::*;
+
+    #[test]
+    fn pending_submission_journal_round_trips_and_refuses_overwrite() {
+        let directory = std::env::temp_dir().join(format!(
+            "bproof-pending-journal-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("wallet.json.pending-submission.json");
+        let prepared = prepared_fixture();
+        let raw = vec![0x02, 0x01, 0x02, 0x03];
+        let hash = keccak256(&raw);
+        let document = PendingSubmissionDocument::from_prepared(
+            hash,
+            &hex_string(&raw),
+            &prepared,
+            "proofHunter",
+            Some("test classification"),
+        );
+
+        persist_pending_document(&path, &document).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let stored = read_pending_document(&path).unwrap();
+        let (stored_hash, stored_raw, stored_prepared) = stored.to_prepared().unwrap();
+        assert_eq!(stored_hash, hash);
+        assert_eq!(stored_raw, raw);
+        assert_eq!(stored_prepared.miner, prepared.miner);
+        assert_eq!(stored_prepared.transaction.data, prepared.transaction.data);
+        assert!(persist_pending_document(&path, &document).is_err());
+        clear_pending_document(&path).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_submission_journal_fails_closed_on_open_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("bproof-pending-permissions-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("pending.json");
+        fs::write(&path, b"{}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_pending_document(&path).unwrap_err();
+        assert!(error.contains("owner-only"), "error: {error}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_submission_journal_rejects_tampered_fee_authority() {
+        let prepared = prepared_fixture();
+        let raw = vec![0x02, 0x01, 0x02, 0x03];
+        let mut document = PendingSubmissionDocument::from_prepared(
+            keccak256(&raw),
+            &hex_string(&raw),
+            &prepared,
+            "proofHunter",
+            None,
+        );
+
+        document.priority_fee_per_gas_wei = "2".to_owned();
+        let error = document.to_prepared().unwrap_err();
+        assert!(error.contains("inconsistent fee fields"), "error: {error}");
+
+        let mut document = PendingSubmissionDocument::from_prepared(
+            keccak256(&raw),
+            &hex_string(&raw),
+            &prepared,
+            "proofHunter",
+            None,
+        );
+        document.maximum_exposure_wei = "1".to_owned();
+        let error = document.to_prepared().unwrap_err();
+        assert!(error.contains("fee exposure"), "error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_submission_journal_refuses_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory =
+            std::env::temp_dir().join(format!("bproof-pending-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("target.json");
+        let link = directory.join("pending.json");
+        fs::write(&target, b"{}\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+        let error = read_pending_document(&link).unwrap_err();
+        assert!(error.contains("securely open"), "error: {error}");
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn recorded_fee_formula_and_margin_bound_total_exposure() {
@@ -903,7 +1449,7 @@ mod tests {
         let transaction_hash = Digest::from_bytes([0x77; 32]);
         let block_hash = Digest::from_bytes([0x88; 32]);
         let block_number = Uint256::from(21_u64);
-        let receipt_value = json!({
+        let mut receipt_value = json!({
             "transactionHash": hex_string(&transaction_hash.to_bytes()),
             "from": hex_string(&prepared.miner.to_bytes()),
             "to": hex_string(&prepared.transaction.to.to_bytes()),
@@ -919,7 +1465,7 @@ mod tests {
                 "blockNumber": "0x15",
                 "removed": false,
                 "topics": [
-                    hex_string(&event_signature(b"ProofAccepted(address,uint256,bytes32,uint256,bytes32,uint256,uint256,uint256,uint256,uint256,uint256,bool)").to_bytes()),
+                    hex_string(&event_signature(b"ProofAccepted(address,uint256,bytes32,uint256,bytes32,uint256,uint256,uint256,uint256,uint256,bool)").to_bytes()),
                     address_topic(prepared.miner),
                     hex_string(&prepared.challenge_id.to_be_bytes()),
                     hex_string(&prepared.expected_digest.to_bytes()),
@@ -929,7 +1475,6 @@ mod tests {
                     prepared.challenge.to_bytes(),
                     prepared.mining_nonce.to_be_bytes(),
                     Uint256::from(100_u64).to_be_bytes(),
-                    Uint256::from(10_u64).to_be_bytes(),
                     Uint256::from(2_u64).to_be_bytes(),
                     Uint256::from(22_u64).to_be_bytes(),
                     Uint256::from(90_u64).to_be_bytes(),
@@ -937,9 +1482,47 @@ mod tests {
                 ]),
             }],
         });
+        let mut mint = receipt_value["logs"][0].clone();
+        mint["topics"] = json!([
+            hex_string(
+                &event_signature(b"ProofNftMinted(address,uint256,uint256,bytes32,uint8,address)")
+                    .to_bytes()
+            ),
+            address_topic(prepared.miner),
+            hex_string(&Uint256::ONE.to_be_bytes()),
+            hex_string(&prepared.challenge_id.to_be_bytes()),
+        ]);
+        let mut basket_word = [0_u8; 32];
+        basket_word[12..].copy_from_slice(&prepared.basket.to_bytes());
+        mint["data"] = json!(abi_data(&[
+            prepared.expected_digest.to_bytes(),
+            Uint256::ONE.to_be_bytes(),
+            basket_word
+        ]));
+        receipt_value["logs"].as_array_mut().unwrap().push(mint);
+        let mut no_mint = receipt_value.clone();
+        no_mint["logs"].as_array_mut().unwrap().pop();
+        assert!(parse_receipt(&no_mint, transaction_hash, &prepared).is_err());
+        let mut wrong_basket = receipt_value.clone();
+        wrong_basket["logs"][1]["data"] = json!(abi_data(&[
+            prepared.expected_digest.to_bytes(),
+            Uint256::ONE.to_be_bytes(),
+            [0; 32]
+        ]));
+        assert!(
+            parse_receipt(&wrong_basket, transaction_hash, &prepared)
+                .unwrap_err()
+                .contains("basket")
+        );
+        let mut duplicate = receipt_value.clone();
+        duplicate["logs"]
+            .as_array_mut()
+            .unwrap()
+            .push(receipt_value["logs"][1].clone());
+        assert!(parse_receipt(&duplicate, transaction_hash, &prepared).is_err());
         let receipt = parse_receipt(&receipt_value, transaction_hash, &prepared).unwrap();
         assert!(receipt.succeeded);
-        assert!(!receipt.proof_nft_minted);
+        assert!(receipt.proof_nft_minted);
         assert_eq!(receipt.block_hash, block_hash);
         assert_eq!(receipt.block_number, block_number);
 
@@ -974,6 +1557,7 @@ mod tests {
             seed_parent_block,
             challenge,
             expected_digest,
+            basket: Address::from_bytes([0x55; 20]),
             transaction: Eip1559Transaction {
                 chain_id: Uint256::from(31_337_u64),
                 account_nonce: Uint256::ZERO,
@@ -981,7 +1565,12 @@ mod tests {
                 max_fee_per_gas: Uint256::from(3_u64),
                 gas_limit: Uint256::from(26_250_u64),
                 to: mining_core,
-                data: submit_proof_call_data(challenge_id, seed_parent_block, mining_nonce),
+                data: submit_proof_call_data(
+                    challenge_id,
+                    seed_parent_block,
+                    mining_nonce,
+                    Address::from_bytes([0x55; 20]),
+                ),
             },
         }
     }
@@ -1026,6 +1615,7 @@ mod tests {
             state.challenge_inputs,
             Address::from_bytes([0x11; 20]),
             Uint256::from(9_u64),
+            Address::from_bytes([0x55; 20]),
             FeeOptions {
                 fee_ceiling_wei: u128::MAX,
                 base_fee_per_gas_override_wei: Some(1),
@@ -1067,6 +1657,7 @@ mod tests {
             challenge_inputs,
             Address::from_bytes([0x11; 20]),
             Uint256::ZERO,
+            Address::from_bytes([0x55; 20]),
             FeeOptions {
                 fee_ceiling_wei: u128::MAX,
                 base_fee_per_gas_override_wei: Some(1),

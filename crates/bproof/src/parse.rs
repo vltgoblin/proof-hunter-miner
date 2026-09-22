@@ -115,6 +115,28 @@ pub fn hex_string(bytes: &[u8]) -> String {
     output
 }
 
+pub fn parse_hex_bytes(value: &str, name: &str) -> Result<Vec<u8>, String> {
+    let Some(hex) = value.strip_prefix("0x") else {
+        return Err(format!("{name} must be 0x-prefixed hexadecimal bytes"));
+    };
+    if hex.len() % 2 != 0 {
+        return Err(format!(
+            "{name} must contain an even number of hexadecimal characters"
+        ));
+    }
+
+    let raw = hex.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.chunks_exact(2) {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| format!("{name} contains a non-hexadecimal character"))?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| format!("{name} contains a non-hexadecimal character"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
 pub fn uint256_to_decimal(value: Uint256) -> String {
     let mut bytes = value.to_be_bytes();
     if bytes.iter().all(|byte| *byte == 0) {

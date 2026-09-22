@@ -1,4 +1,4 @@
-//! Minimal EIP-1559 transaction construction for one MiningCore proof submission.
+//! Minimal EIP-1559 transaction construction for one HunterMiningCore proof submission.
 
 use std::fmt;
 
@@ -7,7 +7,7 @@ use proof_core::{Address, Digest, Uint256, keccak256};
 use crate::keystore::UnlockedWallet;
 
 const EIP_1559_TYPE: u8 = 0x02;
-const SUBMIT_PROOF_SIGNATURE: &str = "submitProof(uint256,uint256,uint256)";
+const SUBMIT_PROOF_SIGNATURE: &str = "submitProof(uint256,uint256,uint256,address)";
 const REDACTED: &str = "[REDACTED]";
 
 /// The unsigned fields of one EIP-1559 transaction.
@@ -64,18 +64,22 @@ impl fmt::Debug for SignedTransaction {
     }
 }
 
-/// Encodes the exact calldata for `MiningCore.submitProof`.
+/// Encodes the exact calldata for `HunterMiningCore.submitProof`.
 #[must_use]
 pub fn submit_proof_call_data(
     expected_challenge_id: Uint256,
     expected_seed_parent_block: Uint256,
     mining_nonce: Uint256,
+    basket: Address,
 ) -> Vec<u8> {
-    let mut data = Vec::with_capacity(4 + 32 * 3);
+    let mut data = Vec::with_capacity(4 + 32 * 4);
     data.extend_from_slice(&keccak256(SUBMIT_PROOF_SIGNATURE.as_bytes()).to_bytes()[..4]);
     data.extend_from_slice(&expected_challenge_id.to_be_bytes());
     data.extend_from_slice(&expected_seed_parent_block.to_be_bytes());
     data.extend_from_slice(&mining_nonce.to_be_bytes());
+    let mut basket_word = [0_u8; 32];
+    basket_word[12..].copy_from_slice(&basket.to_bytes());
+    data.extend_from_slice(&basket_word);
     data
 }
 
@@ -172,14 +176,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn submit_proof_calldata_has_the_recorded_selector_and_three_words() {
+    fn submit_proof_calldata_has_the_recorded_selector_and_four_words() {
+        let basket = Address::from_bytes([0x44; 20]);
         let data = submit_proof_call_data(
             Uint256::from(7_u64),
             Uint256::from(11_u64),
             Uint256::from(13_u64),
+            basket,
         );
 
-        assert_eq!(data.len(), 100);
+        assert_eq!(data.len(), 132);
         assert_eq!(
             &data[..4],
             &keccak256(SUBMIT_PROOF_SIGNATURE.as_bytes()).to_bytes()[..4]
@@ -187,6 +193,9 @@ mod tests {
         assert_eq!(&data[4..36], &Uint256::from(7_u64).to_be_bytes());
         assert_eq!(&data[36..68], &Uint256::from(11_u64).to_be_bytes());
         assert_eq!(&data[68..100], &Uint256::from(13_u64).to_be_bytes());
+        let mut basket_word = [0_u8; 32];
+        basket_word[12..].copy_from_slice(&basket.to_bytes());
+        assert_eq!(&data[100..132], &basket_word);
     }
 
     #[test]

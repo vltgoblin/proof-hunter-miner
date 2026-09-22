@@ -17,7 +17,7 @@ use crate::mining::{MiningControl, MiningRequest, MiningResult, mine_with_contro
 use crate::parse::{hex_string, parse_address, uint256_to_decimal};
 use crate::submit::{
     FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome, SUBMISSION_WARNING,
-    prepare_submission, send_prepared_submission,
+    prepare_submission, recover_pending_submission, send_prepared_submission,
 };
 
 pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -31,6 +31,7 @@ pub struct ContinuousRequest {
     pub chain_id: Uint256,
     pub mining_core: Address,
     pub miner: Address,
+    pub basket: Address,
     pub keystore: PathBuf,
     pub passphrase_file: Option<PathBuf>,
     pub fee_options: FeeOptions,
@@ -259,6 +260,36 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
             }
         }
     }
+    match recover_pending_submission(&reader, &request.keystore) {
+        Ok(Some(recovered)) => {
+            if let Err(error) = book.add_fee(recovered.mined.fee_paid_wei) {
+                return fatal(&writer, &book, error, 1);
+            }
+            if recovered.mined.succeeded {
+                book.update(|summary| {
+                    summary.proofs_accepted += 1;
+                    summary.nfts_earned += u64::from(recovered.mined.proof_nft_minted);
+                    summary.consecutive_failures = 0;
+                });
+            }
+            writer.emit(
+                "submissionRecovered",
+                json!({
+                    "transactionHash": hex_string(&recovered.mined.transaction_hash.to_bytes()),
+                    "miningNonce": uint256_to_decimal(recovered.mined.mining_nonce),
+                    "accountNonce": uint256_to_decimal(recovered.mined.account_nonce),
+                    "feePaidWei": recovered.mined.fee_paid_wei.to_string(),
+                    "succeeded": recovered.mined.succeeded,
+                    "proofNftMinted": recovered.mined.proof_nft_minted,
+                    "nftTokenId": recovered.mined.nft_token_id.map(uint256_to_decimal),
+                    "proofClassification": recovered.proof_classification,
+                    "classificationReason": recovered.classification_reason,
+                }),
+            )?;
+        }
+        Ok(None) => {}
+        Err(error) => return fatal(&writer, &book, error, 2),
+    }
     let wallet = match unlock_wallet(&request) {
         Ok(wallet) => wallet,
         Err(error) => return fatal(&writer, &book, error, 2),
@@ -389,10 +420,18 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                     state.challenge_inputs,
                     request.miner,
                     mining_nonce,
+                    request.basket,
                     request.fee_options,
                 ) {
                     Ok(PreparationOutcome::Ready(prepared)) => {
-                        match send_prepared_submission(&reader, &wallet, *prepared) {
+                        match send_prepared_submission(
+                            &reader,
+                            &wallet,
+                            *prepared,
+                            &request.keystore,
+                            classification.name(),
+                            classification.reason(),
+                        ) {
                             Ok(mined) => {
                                 if let Err(error) = book.add_fee(mined.fee_paid_wei) {
                                     return fatal(&writer, &book, error, 1);
@@ -413,6 +452,7 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                                             "feePaidWei": mined.fee_paid_wei.to_string(),
                                             "maximumExposureWei": mined.fee_quote.maximum_exposure_wei.to_string(),
                                             "proofNftMinted": mined.proof_nft_minted,
+                                            "nftTokenId": mined.nft_token_id.map(uint256_to_decimal),
                                         }),
                                     )?;
                                 } else {
@@ -468,16 +508,11 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                                     }
                                 }
                             }
-                            Err(error) if is_rpc_error(&error) => {
-                                if !rpc_retry(&writer, &shutdown, &mut backoff, error)? {
-                                    return clean_stop(&writer, &book, "interrupt");
-                                }
-                            }
                             Err(error) => {
-                                if repeated_failure(&writer, &book, &shutdown, &mut backoff, error)?
-                                {
-                                    return failed_stop(&writer, &book);
-                                }
+                                // A lost response may follow a successful broadcast. Stop
+                                // instead of generating another signed transaction.
+                                writer.emit("submissionUnresolved", json!({"reason": error}))?;
+                                return failed_stop(&writer, &book);
                             }
                         }
                     }
@@ -771,7 +806,7 @@ fn fee_refusal_reason(quote: &FeeQuote, classification: &ProofClassification) ->
     let (proof_kind, consequence) = match classification {
         ProofClassification::ProofHunter => (
             "Proof Hunter proof",
-            "; refusing it forfeits the whole reward",
+            "; refusing it leaves this proof unsubmitted",
         ),
         ProofClassification::Ordinary => ("ordinary proof", ""),
         ProofClassification::Unknown { .. } => ("proof with unknown classification", ""),
@@ -939,7 +974,7 @@ mod tests {
 
         let hunter_reason = fee_refusal_reason(&quote, &ProofClassification::ProofHunter);
         let ordinary_reason = fee_refusal_reason(&quote, &ProofClassification::Ordinary);
-        assert!(hunter_reason.contains("forfeits the whole reward"));
+        assert!(hunter_reason.contains("leaves this proof unsubmitted"));
         assert!(!ordinary_reason.contains("whole reward"));
         for forbidden in ["privateKey", "passphrase", "mnemonic", "backupPhrase"] {
             assert!(!hunter_reason.contains(forbidden));
@@ -1026,6 +1061,7 @@ mod tests {
             chain_id: challenge_inputs.chain_id,
             mining_core: challenge_inputs.mining_core,
             miner: Address::from_bytes([0x11; 20]),
+            basket: Address::from_bytes([0x55; 20]),
             keystore: PathBuf::from("unused"),
             passphrase_file: None,
             fee_options: FeeOptions {

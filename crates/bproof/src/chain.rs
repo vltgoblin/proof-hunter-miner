@@ -41,7 +41,9 @@ pub struct MiningState {
     pub challenge: Digest,
     pub target: Target,
     pub accepted_proofs: u128,
+    /// Legacy offline schedule counter; never read from HunterMiningCore.
     pub total_minted_wei: u128,
+    pub nfts_minted_ever: Option<u128>,
 }
 
 /// Mining state and the optional NFT-path values read at the same block tag.
@@ -122,6 +124,7 @@ impl ChainReader for FileChainReader {
             target: parse_target(field(fields, "target")?, "target")?,
             accepted_proofs: parse_u128(field(fields, "acceptedProofs")?, "acceptedProofs")?,
             total_minted_wei: parse_u128(field(fields, "totalMintedWei")?, "totalMintedWei")?,
+            nfts_minted_ever: None,
         })
     }
 }
@@ -368,9 +371,9 @@ impl RpcChainReader {
         block_tag: &str,
         accepted_target: Target,
     ) -> Result<NftClassificationSnapshot, String> {
-        let nft_odds_denominator = self
-            .call_word("NFT_ODDS_DENOMINATOR()", block_tag)
-            .map_err(|error| format!("proof classification unknown: {error}"))?;
+        // HunterMiningCore mints one NFT for every accepted proof. There is no
+        // probabilistic NFT path or liquid mining reward in this live ABI.
+        let nft_odds_denominator = Uint256::ONE;
         let max_nfts_ever = self
             .call_word("MAX_NFTS_EVER()", block_tag)
             .map_err(|error| format!("proof classification unknown: {error}"))?;
@@ -400,10 +403,13 @@ impl RpcChainReader {
             self.call_word("acceptedProofs()", block_tag)?,
             "MiningCore.acceptedProofs()",
         )?;
-        let total_minted_wei = uint256_to_u128(
-            self.call_word("totalMintedEver()", block_tag)?,
-            "MiningCore.totalMintedEver()",
+        let nfts_minted_ever = uint256_to_u128(
+            self.call_word("nftsMintedEver()", block_tag)?,
+            "HunterMiningCore.nftsMintedEver()",
         )?;
+        if nfts_minted_ever != accepted_proofs {
+            return Err("HunterMiningCore accepted proof and NFT counters disagree".to_owned());
+        }
         let seed_blockhash = self.seed_blockhash(seed_parent_block, block_tag)?;
         let contract_challenge = Digest::from_bytes(
             self.call_word("currentChallenge()", block_tag)?
@@ -431,7 +437,8 @@ impl RpcChainReader {
             challenge: contract_challenge,
             target,
             accepted_proofs,
-            total_minted_wei,
+            total_minted_wei: 0,
+            nfts_minted_ever: Some(nfts_minted_ever),
         })
     }
 
@@ -545,6 +552,10 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    mod cli_fixture {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/mod.rs"));
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/rpc-chain-state.json");
     const MINING_CORE: Address = Address::from_bytes([
@@ -752,7 +763,6 @@ mod tests {
             .map(json_response)
             .collect::<Vec<_>>();
         responses.extend([
-            word_response("NFT_ODDS_DENOMINATOR()", "0x3ec", Uint256::from(51_u64)),
             word_response("MAX_NFTS_EVER()", "0x3ec", Uint256::from(5_000_u64)),
             word_response("nftsMintedEver()", "0x3ec", Uint256::from(4_999_u64)),
         ]);
@@ -767,7 +777,7 @@ mod tests {
             .nft_classification
             .expect("classification values must decode");
         assert_eq!(nft.accepted_target, snapshot.state.target);
-        assert_eq!(nft.nft_odds_denominator, Uint256::from(51_u64));
+        assert_eq!(nft.nft_odds_denominator, Uint256::ONE);
         assert_eq!(nft.max_nfts_ever, Uint256::from(5_000_u64));
         assert_eq!(nft.nfts_minted_ever, Uint256::from(4_999_u64));
     }
@@ -779,7 +789,7 @@ mod tests {
             .map(json_response)
             .collect::<Vec<_>>();
         responses.push(MockResponse {
-            expected_request: call_request("NFT_ODDS_DENOMINATOR()", "0x3ec"),
+            expected_request: call_request("MAX_NFTS_EVER()", "0x3ec"),
             status: 200,
             body: serde_json::to_string(&json!({
                 "jsonrpc": "2.0",
@@ -802,7 +812,7 @@ mod tests {
             error.contains("proof classification unknown"),
             "error: {error}"
         );
-        assert!(error.contains("NFT_ODDS_DENOMINATOR()"), "error: {error}");
+        assert!(error.contains("MAX_NFTS_EVER()"), "error: {error}");
         assert!(error.contains("getter unavailable"), "error: {error}");
     }
 
@@ -1011,11 +1021,8 @@ mod tests {
             broadcast_dir,
         };
         wait_for_anvil(&endpoint, &mut anvil.child);
-        let mining_core = parse_address(
-            "0x5fbdb2315678afecb367f032d93f642f64180aa3",
-            "live MiningCore",
-        )
-        .expect("deterministic first Anvil deployment address must parse");
+        let mining_core = parse_address(cli_fixture::MINING_CORE, "live MiningCore")
+            .expect("deterministic first Anvil deployment address must parse");
         let expected_chain_id = Uint256::from(31_337_u64);
         let reader = RpcChainReader::new(&endpoint, mining_core, expected_chain_id);
         reader
@@ -1026,34 +1033,12 @@ mod tests {
             )
             .expect("local Anvil basket fixture must have code");
 
-        let forge_cache_dir = anvil.broadcast_dir.join("cache");
-        let deployment = Command::new("forge")
-            .current_dir(&contracts_dir)
-            .env(
-                "LAUNCH_CONFIG_PATH",
-                "config/deploy-launch.example.fake.json",
-            )
-            .env("FOUNDRY_BROADCAST", &anvil.broadcast_dir)
-            .env("FOUNDRY_CACHE_PATH", forge_cache_dir)
-            .args([
-                "script",
-                "script/DeployLaunchSet.s.sol:DeployLaunchSet",
-                "--rpc-url",
-                &endpoint,
-                "--broadcast",
-                "--unlocked",
-            ])
-            .output()
-            .expect("forge must run the existing deployment script");
-        assert!(
-            deployment.status.success(),
-            "launch deployment failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&deployment.stdout),
-            String::from_utf8_lossy(&deployment.stderr)
-        );
+        cli_fixture::deploy(&endpoint, &anvil.broadcast_dir);
 
+        // The RC2 composition uses a 64-block auto-seed margin. Mine beyond
+        // that margin instead of relying on the older 40-block fixture value.
         reader
-            .rpc_result("Anvil seed activation", "anvil_mine", json!(["0x4"]))
+            .rpc_result("Anvil seed activation", "anvil_mine", json!(["0x80"]))
             .expect("local Anvil must mine through the genesis seed block");
 
         let state = reader
@@ -1066,10 +1051,7 @@ mod tests {
             state.challenge_inputs.previous_accepted_digest,
             Digest::ZERO
         );
-        assert_eq!(
-            state.challenge_inputs.seed_parent_block,
-            Uint256::from(4_u64)
-        );
+        assert!(state.challenge_inputs.seed_parent_block > Uint256::ZERO);
         assert_ne!(state.challenge_inputs.seed_blockhash, Digest::ZERO);
         assert_eq!(
             state.target,

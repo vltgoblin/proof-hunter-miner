@@ -31,7 +31,7 @@ use crate::parse::{
 };
 use crate::submit::{
     FEE_REFUSAL_EXIT_CODE, FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome,
-    SUBMISSION_WARNING, prepare_submission, send_prepared_submission,
+    SUBMISSION_WARNING, prepare_submission, recover_pending_submission, send_prepared_submission,
 };
 use bproof::keystore::{
     PassphraseSource, create_keystore, read_keystore_address, read_passphrase, unlock_keystore,
@@ -54,7 +54,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect the fixed reward schedule.
+    /// Inspect the legacy offline token reward schedule (not current NFT-only mining).
     Schedule(ScheduleArgs),
     /// Derive and check one wallet-bound proof with PROOF_VERSION 1.
     Verify(VerifyArgs),
@@ -227,16 +227,19 @@ struct MineArgs {
     /// Read the keystore passphrase from an owner-only file instead of prompting.
     #[arg(long)]
     passphrase_file: Option<PathBuf>,
-    /// Required total transaction-cost ceiling in raw wei; no default. A Proof Hunter win pays zero liquid HUNTER because the whole reward locks inside the Hunter; a ceiling sized for ordinary proofs can refuse and forfeit that whole reward.
+    /// Required total transaction-cost ceiling in raw wei; no default. Each accepted proof mints one NFT, with no liquid token reward; the ceiling must cover the estimated mint transaction.
     #[arg(long)]
     max_fee: Option<String>,
+    /// Basket asset address for HunterMiningCore.submitProof. Required with --submit.
+    #[arg(long)]
+    basket: Option<String>,
     /// Override the chain base fee per gas in raw wei.
     #[arg(long)]
     base_fee_per_gas: Option<String>,
     /// Override the priority fee per gas in raw wei.
     #[arg(long)]
     priority_fee_per_gas: Option<String>,
-    /// Margin added to eth_estimateGas; defaults to the recorded 25 percent.
+    /// Margin added to eth_estimateGas; defaults to 100 percent, still bounded by --max-fee.
     #[arg(long)]
     gas_margin_percent: Option<String>,
 }
@@ -252,6 +255,9 @@ struct SubmitArgs {
     /// Verified MiningCore address as exactly 20 bytes of 0x-prefixed hex.
     #[arg(long)]
     mining_core: String,
+    /// Basket asset address for HunterMiningCore.submitProof as exactly 20 bytes of 0x-prefixed hex.
+    #[arg(long)]
+    basket: String,
     /// Found mining nonce as decimal u128 or exactly 32 bytes of 0x-prefixed hex.
     #[arg(long)]
     mining_nonce: String,
@@ -261,7 +267,7 @@ struct SubmitArgs {
     /// Read the passphrase from an owner-only file instead of prompting without echo.
     #[arg(long)]
     passphrase_file: Option<PathBuf>,
-    /// Total transaction-cost ceiling in raw wei. This flag is mandatory and has no default. A Proof Hunter win pays zero liquid HUNTER because the whole reward locks inside the Hunter; a ceiling sized for ordinary proofs can refuse and forfeit that whole reward.
+    /// Total transaction-cost ceiling in raw wei. This flag is mandatory and has no default. Each accepted proof mints one NFT, with no liquid token reward; the ceiling must cover the estimated mint transaction.
     #[arg(long)]
     max_fee: String,
     /// Override the chain base fee per gas in raw wei.
@@ -270,7 +276,7 @@ struct SubmitArgs {
     /// Override the priority fee per gas in raw wei.
     #[arg(long)]
     priority_fee_per_gas: Option<String>,
-    /// Margin added to eth_estimateGas; defaults to the recorded 25 percent.
+    /// Margin added to eth_estimateGas; defaults to 100 percent, still bounded by --max-fee.
     #[arg(long)]
     gas_margin_percent: Option<String>,
 }
@@ -427,6 +433,29 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
     if args.loop_mode {
         return run_continuous_mine(&args, miner, submission, json);
     }
+    if let Some(submission) = &submission {
+        let endpoint = args
+            .rpc_url
+            .as_deref()
+            .ok_or_else(|| "--rpc-url is required with --submit".to_owned())?;
+        let chain_id =
+            parse_decimal_uint256(required_live(&args.chain_id, "--chain-id")?, "--chain-id")?;
+        let mining_core = parse_address(
+            required_live(&args.mining_core, "--mining-core")?,
+            "--mining-core",
+        )?;
+        let reader = RpcChainReader::new(endpoint, mining_core, chain_id);
+        reader.verify_identity()?;
+        if let Some(recovered) = recover_pending_submission(&reader, &submission.keystore)? {
+            return submission_result(
+                recovered.mined,
+                recovered.miner,
+                &recovered.proof_classification,
+                recovered.classification_reason,
+                json,
+            );
+        }
+    }
     let resolved = resolve_mine_state(&args)?;
     let challenge_inputs = resolved.challenge_inputs;
     let target = resolved.target;
@@ -479,6 +508,7 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
                     challenge_inputs,
                     miner,
                     mining_nonce,
+                    submission.basket,
                     &submission.keystore,
                     submission.passphrase_file.as_deref(),
                     submission.fee_options,
@@ -581,6 +611,7 @@ fn run_continuous_mine(
             chain_id,
             mining_core,
             miner,
+            basket: submission.basket,
             keystore: submission.keystore,
             passphrase_file: submission.passphrase_file,
             fee_options: submission.fee_options,
@@ -599,6 +630,7 @@ fn run_continuous_mine(
 fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
     let chain_id = parse_decimal_uint256(&args.chain_id, "--chain-id")?;
     let mining_core = parse_address(&args.mining_core, "--mining-core")?;
+    let basket = parse_address(&args.basket, "--basket")?;
     let mining_nonce = parse_nonce(&args.mining_nonce, "--mining-nonce")?;
     let miner_text = read_keystore_address(&args.keystore)?;
     let miner = parse_address(&miner_text, "keystore miner address")?;
@@ -609,6 +641,16 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
         args.gas_margin_percent.as_deref(),
     )?;
     let reader = RpcChainReader::new(&args.rpc_url, mining_core, chain_id);
+    reader.verify_identity()?;
+    if let Some(recovered) = recover_pending_submission(&reader, &args.keystore)? {
+        return submission_result(
+            recovered.mined,
+            recovered.miner,
+            &recovered.proof_classification,
+            recovered.classification_reason,
+            json,
+        );
+    }
     let classified_state = reader.read_classified_state()?;
     let state = classified_state.state;
     let digest = proof_digest(&ProofInputs {
@@ -635,6 +677,7 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
         state.challenge_inputs,
         miner,
         mining_nonce,
+        basket,
         &args.keystore,
         args.passphrase_file.as_deref(),
         fee_options,
@@ -646,6 +689,7 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
 struct MineSubmissionConfig {
     keystore: PathBuf,
     passphrase_file: Option<PathBuf>,
+    basket: proof_core::Address,
     fee_options: FeeOptions,
 }
 
@@ -663,6 +707,7 @@ fn resolve_mine_identity_and_submission(
             (args.keystore.is_some(), "--keystore"),
             (args.passphrase_file.is_some(), "--passphrase-file"),
             (args.max_fee.is_some(), "--max-fee"),
+            (args.basket.is_some(), "--basket"),
             (args.base_fee_per_gas.is_some(), "--base-fee-per-gas"),
             (
                 args.priority_fee_per_gas.is_some(),
@@ -707,6 +752,11 @@ fn resolve_mine_identity_and_submission(
             return Err("--miner does not match the --keystore mining address".to_owned());
         }
     }
+    let basket_text = args
+        .basket
+        .as_deref()
+        .ok_or_else(|| "--basket is required with --submit".to_owned())?;
+    let basket = parse_address(basket_text, "--basket")?;
     let fee_options = parse_fee_options(
         max_fee,
         args.base_fee_per_gas.as_deref(),
@@ -718,6 +768,7 @@ fn resolve_mine_identity_and_submission(
         Some(MineSubmissionConfig {
             keystore,
             passphrase_file: args.passphrase_file.clone(),
+            basket,
             fee_options,
         }),
     ))
@@ -750,22 +801,29 @@ fn complete_submission(
     challenge_inputs: ChallengeInputs,
     miner: proof_core::Address,
     mining_nonce: Uint256,
+    basket: proof_core::Address,
     keystore: &std::path::Path,
     passphrase_file: Option<&std::path::Path>,
     fee_options: FeeOptions,
     classification: ProofClassification,
     json: bool,
 ) -> Result<RunResult, String> {
-    let prepared =
-        match prepare_submission(reader, challenge_inputs, miner, mining_nonce, fee_options)? {
-            PreparationOutcome::SimulationRejected { reason } => {
-                return rejected_submission(reason, miner, mining_nonce, classification, json);
-            }
-            PreparationOutcome::FeeRefused(quote) => {
-                return refused_submission(quote, miner, mining_nonce, classification, json);
-            }
-            PreparationOutcome::Ready(prepared) => *prepared,
-        };
+    let prepared = match prepare_submission(
+        reader,
+        challenge_inputs,
+        miner,
+        mining_nonce,
+        basket,
+        fee_options,
+    )? {
+        PreparationOutcome::SimulationRejected { reason } => {
+            return rejected_submission(reason, miner, mining_nonce, classification, json);
+        }
+        PreparationOutcome::FeeRefused(quote) => {
+            return refused_submission(quote, miner, mining_nonce, classification, json);
+        }
+        PreparationOutcome::Ready(prepared) => *prepared,
+    };
 
     if !json {
         eprintln!("WARNING: {SUBMISSION_WARNING}");
@@ -776,9 +834,33 @@ fn complete_submission(
     if parse_address(wallet.address(), "unlocked keystore miner address")? != miner {
         return Err("unlocked keystore mining address changed after simulation".to_owned());
     }
-    let mined = send_prepared_submission(reader, &wallet, prepared)?;
+    let mined = send_prepared_submission(
+        reader,
+        &wallet,
+        prepared,
+        keystore,
+        classification.name(),
+        classification.reason(),
+    )?;
+    submission_result(
+        mined,
+        miner,
+        classification.name(),
+        classification.reason().map(str::to_owned),
+        json,
+    )
+}
+
+fn submission_result(
+    mined: crate::submit::MinedSubmission,
+    miner: proof_core::Address,
+    proof_classification: &str,
+    classification_reason: Option<String>,
+    json: bool,
+) -> Result<RunResult, String> {
     let quote = mined.fee_quote;
     let output = SubmissionOutput {
+        nft_token_id: mined.nft_token_id.map(uint256_to_decimal),
         status: if mined.succeeded { "mined" } else { "rejected" },
         reason: (!mined.succeeded).then(|| {
             "transaction was mined but reverted; the challenge may have moved before inclusion"
@@ -797,8 +879,8 @@ fn complete_submission(
         estimated_gas: quote.estimated_gas.to_string(),
         gas_margin_percent: quote.gas_margin_percent.to_string(),
         gas_limit: quote.gas_limit.to_string(),
-        proof_classification: classification.name(),
-        classification_reason: classification.reason().map(str::to_owned),
+        proof_classification: proof_classification.to_owned(),
+        classification_reason,
         state_source: CHAIN_STATE_SOURCE,
         warning: SUBMISSION_WARNING,
     };
@@ -868,7 +950,7 @@ fn fee_refusal_reason(quote: &FeeQuote, classification: &ProofClassification) ->
     let (proof_kind, consequence) = match classification {
         ProofClassification::ProofHunter => (
             "Proof Hunter proof",
-            "; refusing it forfeits the whole reward",
+            "; refusing it leaves this proof unsubmitted",
         ),
         ProofClassification::Ordinary => ("ordinary proof", ""),
         ProofClassification::Unknown { .. } => ("proof with unknown classification", ""),
@@ -881,6 +963,7 @@ fn fee_refusal_reason(quote: &FeeQuote, classification: &ProofClassification) ->
 
 fn run_status(args: StatusArgs, json: bool) -> Result<RunResult, String> {
     let (state, state_source) = resolve_status_state(&args)?;
+    let legacy = state.nfts_minted_ever.is_none();
     let divisor = divisor_at(state.accepted_proofs);
     let reward = reward_at(state.accepted_proofs, state.total_minted_wei);
     let reserve = reserve_for(reward);
@@ -894,10 +977,16 @@ fn run_status(args: StatusArgs, json: bool) -> Result<RunResult, String> {
         seed_blockhash: hex_string(&inputs.seed_blockhash.to_bytes()),
         target: hex_string(&state.target.to_be_bytes()),
         accepted_proofs: state.accepted_proofs.to_string(),
-        total_minted_wei: state.total_minted_wei.to_string(),
-        divisor: divisor.to_string(),
-        reward_wei: reward.to_string(),
-        reserve_wei: reserve.to_string(),
+        total_minted_wei: legacy.then(|| state.total_minted_wei.to_string()),
+        divisor: legacy.then(|| divisor.to_string()),
+        reward_wei: legacy.then(|| reward.to_string()),
+        reserve_wei: legacy.then(|| reserve.to_string()),
+        settlement_mode: if legacy {
+            "legacyOfflineSchedule"
+        } else {
+            "nftOnly"
+        },
+        nfts_minted_ever: state.nfts_minted_ever.map(|n| n.to_string()),
         state_source: state_source.to_owned(),
     };
 
@@ -1273,7 +1362,7 @@ mod tests {
             output["reason"]
                 .as_str()
                 .unwrap()
-                .contains("forfeits the whole reward")
+                .contains("leaves this proof unsubmitted")
         );
         assert_new_output_has_no_secret_labels(result.output.as_str());
     }

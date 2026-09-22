@@ -9,7 +9,10 @@ use std::thread::{self, JoinHandle};
 
 use proof_core::{Address, ChallengeInputs, Digest, SearchResult, Target, Uint256, search_nonce};
 
-const ATTEMPT_BATCH: u64 = 256;
+// Keep cancellation responsive without forcing every worker through the
+// coordinator after only a few hundred hashes.  The smaller batch left most
+// VPS cores waiting on channels during realistic RC2 searches.
+const ATTEMPT_BATCH: u64 = 16 * 1024;
 
 /// Cancellation shared by the challenge watcher and every search worker.
 #[derive(Clone, Debug, Default)]

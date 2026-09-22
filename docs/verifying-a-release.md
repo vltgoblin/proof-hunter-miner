@@ -1,6 +1,8 @@
 # Verify a miner release
 
-Each release contains five `bproof` binaries and a `SHA256SUMS` file:
+**RC2 status:** v0.1.0 is a legacy token-mining release, not an accepted NFT-only RC2 binary. Verify the release model and approved network profile before use.
+
+The binary release workflow produces five `bproof` binaries and a `SHA256SUMS` file:
 
 | System | Release file |
 |---|---|

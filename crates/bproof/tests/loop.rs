@@ -12,16 +12,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use proof_core::{keccak256, reward_at};
+use proof_core::keccak256;
+mod common;
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-const MINING_CORE: &str = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+const MINING_CORE: &str = common::MINING_CORE;
 const CHAIN_ID: &str = "31337";
-const PROOF_HUNTER_FEE_WARNING: &str = "An accepted Proof Hunter win pays zero liquid HUNTER because the whole reward locks inside the Hunter. It costs materially more than an ordinary proof; --max-fee must cover that larger transaction or the miner will refuse and forfeit the whole reward.";
+const PROOF_HUNTER_FEE_WARNING: &str = "Every accepted HunterMiningCore proof mints one NFT and pays no liquid HUNTER. Token activation and backing are separate from mining; no backing amount is promised. --max-fee must cover the estimated mint transaction or submission is refused.";
 
 #[test]
 fn loop_requires_explicit_submission_and_documents_streaming_events() {
@@ -102,6 +103,8 @@ fn unreachable_endpoint_uses_growing_backoff_and_stops_cleanly() {
             CHAIN_ID,
             "--mining-core",
             MINING_CORE,
+            "--basket",
+            common::BASKET,
             "--keystore",
             keystore.to_str().unwrap(),
             "--passphrase-file",
@@ -192,7 +195,9 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
         json!(["0x00000000000000000000000000000000000ba5e7", "0x00"]),
     );
     deploy_launch_set(&endpoint, &directory);
-    rpc(&endpoint, "anvil_mine", json!(["0x4"]));
+    // RC2 uses a 64-block auto-seed margin; advance past it before starting
+    // the continuous loop instead of relying on the older 40-block fixture.
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
 
     let keystore = directory.join("loop-wallet.json");
     let recovery_file = directory.join("loop-wallet-recovery.txt");
@@ -219,11 +224,9 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
         json!([miner, "0xde0b6b3a7640000"]),
     );
 
-    let project_token = mining_core_child_address(&endpoint, "PROJECT_TOKEN()");
-    let first_reward = reward_at(0, 0);
-    let expected_minted = first_reward + reward_at(1, first_reward);
+    let nft = mining_core_child_address(&endpoint, "PROOF_NFT()");
     assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 1);
-    assert_eq!(mining_core_word(&endpoint, "totalMintedEver()"), 0);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 0);
     assert_fee_refusal_continues(
         &endpoint,
         &keystore,
@@ -244,6 +247,8 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
             CHAIN_ID,
             "--mining-core",
             MINING_CORE,
+            "--basket",
+            common::BASKET,
             "--keystore",
             keystore.to_str().unwrap(),
             "--passphrase-file",
@@ -295,8 +300,8 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
         if event["event"] == "proofAccepted" {
             accepted.push(event.clone());
             if accepted.len() == 1 {
-                // Each accepted proof selects a seed three parent blocks ahead.
-                rpc(&endpoint, "anvil_mine", json!(["0x4"]));
+                // Each accepted proof selects a seed ahead of the current parent block.
+                rpc(&endpoint, "anvil_mine", json!(["0x80"]));
             } else if accepted.len() == 2 {
                 send_interrupt(child.id());
                 interrupt_sent = true;
@@ -364,15 +369,9 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
 
     assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 3);
     assert_eq!(mining_core_word(&endpoint, "acceptedProofs()"), 2);
-    assert_eq!(
-        mining_core_word(&endpoint, "totalMintedEver()"),
-        expected_minted
-    );
-    assert_eq!(
-        contract_word(&endpoint, &project_token, "totalSupply()"),
-        expected_minted
-    );
-    assert!(token_balance(&endpoint, &project_token, &miner) > 0);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 2);
+    assert_eq!(token_balance(&endpoint, &nft, &miner), 2);
+    assert_eq!(expected_nfts, "2");
     assert_eq!(account_transaction_count(&endpoint, &miner), 2);
 
     let output = events
@@ -422,6 +421,8 @@ fn assert_fee_refusal_continues(
             CHAIN_ID,
             "--mining-core",
             MINING_CORE,
+            "--basket",
+            common::BASKET,
             "--keystore",
             keystore.to_str().unwrap(),
             "--passphrase-file",
@@ -541,31 +542,7 @@ fn send_interrupt(process_id: u32) {
 }
 
 fn deploy_launch_set(endpoint: &str, directory: &Path) {
-    let contracts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../contracts");
-    let deployment = Command::new("forge")
-        .current_dir(contracts_dir)
-        .env(
-            "LAUNCH_CONFIG_PATH",
-            "config/deploy-launch.example.fake.json",
-        )
-        .env("FOUNDRY_BROADCAST", directory.join("broadcast"))
-        .env("FOUNDRY_CACHE_PATH", directory.join("forge-cache"))
-        .args([
-            "script",
-            "script/DeployLaunchSet.s.sol:DeployLaunchSet",
-            "--rpc-url",
-            endpoint,
-            "--broadcast",
-            "--unlocked",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        deployment.status.success(),
-        "launch deployment failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&deployment.stdout),
-        String::from_utf8_lossy(&deployment.stderr)
-    );
+    common::deploy(endpoint, directory);
 }
 
 fn mining_core_child_address(endpoint: &str, signature: &str) -> String {

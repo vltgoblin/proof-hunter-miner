@@ -1,106 +1,86 @@
-# Proof Hunter Miner
+# Proof Hunters CLI
 
-Mine **HUNTER** on the Robinhood Chain **testnet** with `bproof` — a
-deterministic, non-custodial command-line miner written in Rust.
+The live `bproof` reader and submitter target `HunterMiningCore`: each accepted
+proof mints one NFT. Mining does not pay liquid HUNTER, and token activation or
+backing is a separate operation. `status --json` reports `settlementMode: nftOnly`
+and `nftsMintedEver`; successful submissions include `nftTokenId`.
 
-- **Your key never leaves your machine.** The wallet is generated locally,
-  encrypted on your disk, and the recovery phrase is written only to a
-  private file you name. Nothing is ever printed to the screen, sent over
-  the network, or written to logs.
-- **Every claim is checkable.** The reward schedule is a fixed, published
-  table you can re-derive yourself with `bproof schedule`. The contracts
-  are verified on the chain explorer.
-- **No administrator.** Nobody can change the rules, the schedule, or the
-  supply. Not even the people who wrote it.
-
-Site: https://proof-hunter-eight.vercel.app
-
-## The game in one paragraph
-
-Each round the chain publishes a puzzle. Your machine searches for a
-winning number bound to *your* wallet address — a found proof is useless
-to anyone else. Submit it and you win HUNTER from a fixed, shrinking
-schedule. Each accepted proof also has a **1-in-51** chance of minting a
-**Proof Hunter** — a limited NFT that permanently seals that entire win
-inside itself. Burn the Hunter and the sealed HUNTER comes back out.
-
-## Testnet addresses (chain 46630)
-
-| What | Address |
-|---|---|
-| MiningCore (the game) | `0x2ebb9e7F35655fE1d07c0A21FCD28Ee7e531FAE9` |
-| Proof Hunters (the NFT) | `0x3ECEDD3D006929226903d5b41E893ADB36DDC944` |
-| HUNTER (the token) | `0x01CEd8f4AbDD0e3F52263d69f4A6438E864967fb` |
-
-RPC: `https://rpc.testnet.chain.robinhood.com`
-
-## Quickstart
-
-You need Rust (https://rustup.rs) and a little testnet gas for the
-submit transactions (see the Robinhood Chain docs:
-https://docs.robinhood.com/chain).
+Build from the repository root:
 
 ```sh
-# 1. Build
 cargo build --release
-alias bproof=./target/release/bproof
-
-# 2. Create your local mining wallet.
-#    The 24-word recovery phrase goes ONLY into the file you name here.
-#    Store that file somewhere safe, then move it off this machine.
-bproof wallet new \
-  --keystore ~/.proof-hunter/wallet.json \
-  --recovery-out ~/.proof-hunter/recovery.txt
-
-# 3. Fund the printed address with testnet gas, then mine continuously.
-#    --max-fee is a hard ceiling in wei on what one submission may cost;
-#    the miner refuses to sign anything above it.
-bproof mine \
-  --rpc-url https://rpc.testnet.chain.robinhood.com \
-  --chain-id 46630 \
-  --mining-core 0x2ebb9e7F35655fE1d07c0A21FCD28Ee7e531FAE9 \
-  --keystore ~/.proof-hunter/wallet.json \
-  --submit --loop \
-  --max-fee 2000000000000000
+target/release/bproof --help
+target/release/bproof wallet new --help
 ```
 
-`Ctrl-C` stops cleanly. Type `summary` and press Enter while it runs to
-get a progress report. Add `--json` for machine-readable event lines.
-
-Every subcommand documents itself: `bproof --help`,
-`bproof mine --help`, `bproof wallet --help`, `bproof status --help`.
-
-## Download a release
-
-Download the binary for your system from
-[GitHub Releases](https://github.com/vltgoblin/proof-hunter-miner/releases).
-Before you run it, follow [Verify a miner release](docs/verifying-a-release.md)
-to check its GitHub build attestation and SHA-256 checksum.
-
-## Check things yourself
+Create a dedicated encrypted mining wallet using `wallet new`. Keep the recovery
+file private. The CLI signs with that wallet, not the browser's MetaMask account.
+Use an approved deployment's chain ID, core and admitted basket addresses. Do not
+copy addresses from test fixtures into a public deployment.
 
 ```sh
-# Re-derive the entire fixed reward schedule and its digest locally:
-bproof schedule
+target/release/bproof status \
+  --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --json
 
-# Inspect live game state straight from the contract:
-bproof status --rpc-url https://rpc.testnet.chain.robinhood.com \
-  --chain-id 46630 \
-  --mining-core 0x2ebb9e7F35655fE1d07c0A21FCD28Ee7e531FAE9
-
-# Run the test suite:
-cargo test --workspace
+target/release/bproof mine --submit \
+  --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" \
+  --basket "$BASKET" --keystore ./miner-wallet.json \
+  --max-fee "$MAX_TOTAL_FEE_WEI" --json
 ```
 
-## Safety notes
+`--max-fee` is the maximum total gas exposure in **wei**, not a gas price.
+The default gas margin is 100% above `eth_estimateGas`; the full padded exposure
+must fit the explicit ceiling. It is a buffer, not a guarantee of successful
+execution. A reverted transaction can still spend gas. Add `--loop` for continuous
+mining; Ctrl-C stops it. A restart after confirmed completion reads the chain's
+account nonce and restores the same encrypted wallet.
 
-- This is a **testnet**. Tokens and NFTs here have no monetary value.
-- The miner never asks for a private key and never prints one. If any
-  tool claiming to be part of this project asks for your key or recovery
-  phrase, it is not ours — close it.
-- Use a dedicated wallet for mining. Do not reuse a wallet that holds
-  anything you care about.
+Receipt acceptance requires the current core's `ProofAccepted` and exactly one
+matching `ProofNftMinted` event, consistent with the transaction, miner, challenge,
+proof digest and requested basket. RPC data remains a trust source.
 
-## License
+Before broadcast, the CLI writes an owner-only durable journal beside the
+keystore containing the exact signed transaction and the public verification
+context. If the process crashes or an RPC reply is lost, the next invocation
+reconciles or rebroadcasts those same signed bytes and verifies the canonical
+receipt before allowing a new transaction. Corrupt, overly permissive, or
+inconsistent journal state fails closed. Never delete a pending journal merely
+to bypass this guard; reconcile its transaction first.
 
-MIT — see [LICENSE](LICENSE).
+The search uses the core's base target. It does not optimize mining for an attached
+NFT's boosted effective target. `schedule` and `--state-file` remain legacy offline
+calculation tools; their token schedule is not the current live settlement model.
+
+See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
+
+## Network profiles and AI agents
+
+The network launcher in [distribution](distribution/README.md) defaults to testnet.
+Both profiles are disabled pending acceptance. Mainnet uses its own verified
+configuration and explicit confirmation; it never inherits testnet addresses.
+
+```sh
+python3 distribution/proof-hunters --network testnet profile
+python3 -m unittest discover -s distribution -p 'test_*.py'
+cargo test --workspace --locked
+```
+
+Install [the mining skill](agent-skills/proof-hunters-mining/SKILL.md) in your
+agent's skill directory. It uses bounded mining calls and an explicit gas ceiling.
+
+## Release status
+
+This source update is an RC2 candidate. The existing **v0.1.0 release is legacy**
+and is not the NFT-only RC2 miner. Do not use its old contract addresses for RC2.
+No accepted RC2 binary or active network profile is supplied by this change.
+The approximate 30-day collection model is a calibration target, not a promise
+about an individual miner or completion date.
+
+Standalone Rust checks skip production-contract integration tests when the
+monorepo contracts are absent. Those tests must also pass in the canonical
+bonded-proof checkout with pinned Foundry 1.7.1 before release acceptance.
+See [source provenance](docs/source-snapshot.json) and
+[release verification](docs/verifying-a-release.md).
+
+[Website](https://proofhunter.fun) · [App](https://app.proofhunter.fun) ·
+[Documentation](https://doc.proofhunter.fun)

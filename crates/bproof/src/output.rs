@@ -74,16 +74,25 @@ pub struct StatusOutput {
     pub seed_blockhash: String,
     pub target: String,
     pub accepted_proofs: String,
-    pub total_minted_wei: String,
-    pub divisor: String,
-    pub reward_wei: String,
-    pub reserve_wei: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_minted_wei: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divisor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reward_wei: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_wei: Option<String>,
+    pub settlement_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nfts_minted_ever: Option<String>,
     pub state_source: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nft_token_id: Option<String>,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -100,7 +109,7 @@ pub struct SubmissionOutput {
     pub estimated_gas: String,
     pub gas_margin_percent: String,
     pub gas_limit: String,
-    pub proof_classification: &'static str,
+    pub proof_classification: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification_reason: Option<String>,
     pub state_source: &'static str,
@@ -240,8 +249,8 @@ pub fn render_status(value: &StatusOutput, json: bool) -> Result<String, String>
         return render_json(value);
     }
 
-    Ok(format!(
-        "chainId: {}\nminingCore: {}\nchallengeId: {}\npreviousAcceptedDigest: {}\nseedParentBlock: {}\nseedBlockhash: {}\ntarget: {}\nacceptedProofs: {}\ntotalMintedWei: {}\ndivisor: {}\nrewardWei: {}\nreserveWei: {}\nstateSource: {}",
+    let mut output = format!(
+        "chainId: {}\nminingCore: {}\nchallengeId: {}\npreviousAcceptedDigest: {}\nseedParentBlock: {}\nseedBlockhash: {}\ntarget: {}\nacceptedProofs: {}\nsettlementMode: {}\nstateSource: {}",
         value.chain_id,
         value.mining_core,
         value.challenge_id,
@@ -250,12 +259,21 @@ pub fn render_status(value: &StatusOutput, json: bool) -> Result<String, String>
         value.seed_blockhash,
         value.target,
         value.accepted_proofs,
-        value.total_minted_wei,
-        value.divisor,
-        value.reward_wei,
-        value.reserve_wei,
-        value.state_source
-    ))
+        value.settlement_mode,
+        value.state_source,
+    );
+    for (name, field) in [
+        ("nftsMintedEver", &value.nfts_minted_ever),
+        ("totalMintedWei", &value.total_minted_wei),
+        ("divisor", &value.divisor),
+        ("rewardWei", &value.reward_wei),
+        ("reserveWei", &value.reserve_wei),
+    ] {
+        if let Some(value) = field {
+            output.push_str(&format!("\n{name}: {value}"));
+        }
+    }
+    Ok(output)
 }
 
 pub fn render_submission(value: &SubmissionOutput, json: bool) -> Result<String, String> {
@@ -284,6 +302,9 @@ pub fn render_submission(value: &SubmissionOutput, json: bool) -> Result<String,
     );
     if let Some(classification_reason) = &value.classification_reason {
         output.push_str(&format!("\nclassificationReason: {classification_reason}"));
+    }
+    if let Some(id) = &value.nft_token_id {
+        output.push_str(&format!("\nnftTokenId: {id}"));
     }
     if let Some(reason) = &value.reason {
         output.push_str(&format!("\nreason: {reason}"));

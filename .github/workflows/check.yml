@@ -1,0 +1,13 @@
+name: Candidate checks
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install 1.90.0 --profile minimal --no-self-update
+      - run: python3 -m unittest discover -s distribution -p 'test_*.py'
+      - run: cargo test --workspace --locked
+      # Contract-backed acceptance runs in the canonical bonded-proof checkout.
