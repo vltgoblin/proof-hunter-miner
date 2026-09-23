@@ -1,7 +1,7 @@
 # Proof Hunters network launcher
 
 Requires Python 3.9+ and the native `bproof` binary included in the release bundle.
-Mainnet is live on chain 4663. The v0.2.2 bundles pin each platform binary and the
+Mainnet is live on chain 4663. The v0.2.3 bundles pin each platform binary and the
 deployed contract bytecode. Source templates remain disabled; testnet is disabled.
 
 ## Commands

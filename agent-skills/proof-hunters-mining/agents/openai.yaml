@@ -1,0 +1,4 @@
+interface:
+  display_name: "Proof Hunters Mining"
+  short_description: "Check mining status and run bounded NFT mining"
+  default_prompt: "Use $proof-hunters-mining to check the live mining profile and status without sending transactions, then explain what is needed for a bounded mining attempt."

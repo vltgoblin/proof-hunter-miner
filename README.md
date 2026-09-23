@@ -72,8 +72,16 @@ python3 -m unittest discover -s distribution -p 'test_*.py'
 cargo test --workspace --locked
 ```
 
-Install [the mining skill](agent-skills/proof-hunters-mining/SKILL.md) in your
-agent's skill directory. It uses bounded mining calls and an explicit gas ceiling.
+Install the public [Proof Hunters Agent Skills](https://github.com/vltgoblin/proof-hunters-skills):
+
+```sh
+npx skills add vltgoblin/proof-hunters-skills --skill proof-hunters-mining
+```
+
+It uses verified v0.2.3 bundles, bounded mining calls, explicit gas budgets,
+assigned HUNTER power, and automatic seed refresh. Start with a read-only status
+check. Installing the skill does not authorize transactions. A matching copy is
+included at [agent-skills/proof-hunters-mining](agent-skills/proof-hunters-mining/SKILL.md).
 
 ## Release status
 
