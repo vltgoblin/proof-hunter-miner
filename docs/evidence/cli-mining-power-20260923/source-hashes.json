@@ -1,0 +1,7 @@
+{
+  "crates/bproof/src/chain.rs": "ba912d051e6e679da58f48e14d619dfaf0540d024b558735885fa305e39bc8bb",
+  "crates/bproof/src/cli.rs": "d91d920bac5943b1ddd0c7df958bbd0cc4750a4605806a7104e86121da6ed503",
+  "crates/bproof/src/continuous.rs": "aa88b78c6a85ecca50618e7f3ec7908de3f4abc7cb73fdf744fb6ea5043f8308",
+  "crates/bproof/src/power.rs": "9408b0811be1dc83fb738866689e8835db031ecb4f46b52624b6d8f7a5a85a15",
+  "crates/bproof/tests/submit.rs": "b166ce787a9318807bf9d434faf8ff870d7859cc4d3ce5d2a316ec1f84dd35a5"
+}

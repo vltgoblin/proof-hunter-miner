@@ -50,6 +50,8 @@ pub struct MiningState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassifiedMiningState {
     pub state: MiningState,
+    pub effective_target: Target,
+    pub power_multiplier_wad: Uint256,
     pub nft_classification: Result<NftClassificationSnapshot, String>,
 }
 
@@ -356,14 +358,59 @@ impl RpcChainReader {
         })
     }
 
-    pub(crate) fn read_classified_state(&self) -> Result<ClassifiedMiningState, String> {
+    pub(crate) fn read_classified_state(
+        &self,
+        miner: Option<Address>,
+    ) -> Result<ClassifiedMiningState, String> {
         let block_tag = self.verified_block_tag()?;
         let state = self.read_state_at(&block_tag)?;
-        let nft_classification = self.read_nft_classification_at(&block_tag, state.target);
+        let (effective_target, power_multiplier_wad) = match miner {
+            Some(miner) => self.read_mining_power_at(&block_tag, &state, miner)?,
+            None => (state.target, Uint256::from(crate::power::BASE_WAD)),
+        };
+        let nft_classification = self.read_nft_classification_at(&block_tag, effective_target);
         Ok(ClassifiedMiningState {
             state,
+            effective_target,
+            power_multiplier_wad,
             nft_classification,
         })
+    }
+
+    // Use the core-selected module and challenge snapshot, never loose HUNTER
+    // balances or current assignment previews. eth_call discards lazy freeze writes.
+    fn read_mining_power_at(
+        &self,
+        block_tag: &str,
+        state: &MiningState,
+        miner: Address,
+    ) -> Result<(Target, Uint256), String> {
+        let module = self.call_word("miningPower()", block_tag)?.to_be_bytes();
+        if module[..12].iter().any(|byte| *byte != 0) {
+            return Err("MiningCore.miningPower() returned a malformed address".to_owned());
+        }
+        if module == [0; 32] {
+            return Ok((state.target, Uint256::from(crate::power::BASE_WAD)));
+        }
+        let module = hex_string(&module[12..]);
+        let mut data = function_selector("powerMultiplierWad(uint256,address)");
+        data.push_str(&hex_string(&state.challenge_inputs.challenge_id.to_be_bytes())[2..]);
+        data.push_str(&"0".repeat(24));
+        data.push_str(&hex_string(&miner.to_bytes())[2..]);
+        let result = self.string_result(
+            "challenge mining power", "eth_call",
+            json!([{"to": module, "from": hex_string(&self.mining_core_address.to_bytes()), "data": data}, block_tag]),
+        )?;
+        let raw = parse_uint256_word(&result, "MiningPower.powerMultiplierWad return value")?;
+        let multiplier = raw
+            .max(Uint256::from(crate::power::BASE_WAD))
+            .min(Uint256::from(crate::power::MAX_WAD));
+        if multiplier == Uint256::from(crate::power::BASE_WAD) {
+            return Ok((state.target, multiplier));
+        }
+        let maximum = self.call_word("MAX_TARGET()", block_tag)?;
+        let effective = crate::power::effective_target(state.target, raw, maximum)?;
+        Ok((effective, multiplier))
     }
 
     fn read_nft_classification_at(
@@ -757,6 +804,89 @@ mod tests {
     }
 
     #[test]
+    fn mining_power_reads_share_snapshot_and_classify_bonus_proofs_as_nfts() {
+        let miner = Address::from_bytes([0x11; 20]);
+        let module_word = Uint256::from(0x1234_u64);
+        let mut responses = recorded_exchanges()
+            .into_iter()
+            .map(json_response)
+            .collect::<Vec<_>>();
+        responses.push(word_response("miningPower()", "0x3ec", module_word));
+        responses.push(power_response(miner, json!({"result": hex_string(&Uint256::from(2_000_000_000_000_000_000_u64).to_be_bytes())})));
+        responses.push(word_response(
+            "MAX_TARGET()",
+            "0x3ec",
+            Uint256::from_be_bytes([255; 32]),
+        ));
+        responses.push(word_response(
+            "MAX_NFTS_EVER()",
+            "0x3ec",
+            Uint256::from(5000_u64),
+        ));
+        responses.push(word_response("nftsMintedEver()", "0x3ec", Uint256::ZERO));
+        let (endpoint, server) = spawn_mock_server(responses);
+        let snapshot = RpcChainReader::new(endpoint, MINING_CORE, EXPECTED_CHAIN_ID)
+            .read_classified_state(Some(miner))
+            .unwrap();
+        server.join().unwrap();
+        assert!(snapshot.effective_target.to_be_bytes() > snapshot.state.target.to_be_bytes());
+        assert_eq!(
+            snapshot.power_multiplier_wad,
+            Uint256::from(2_000_000_000_000_000_000_u64)
+        );
+        let mut bonus_digest = snapshot.state.target.to_be_bytes();
+        bonus_digest[0] = 0x80;
+        assert_eq!(
+            crate::classification::classify_proof(
+                Digest::from_bytes(bonus_digest),
+                &snapshot.nft_classification
+            ),
+            crate::classification::ProofClassification::ProofHunter
+        );
+    }
+
+    #[test]
+    fn power_rpc_failure_or_malformed_word_never_falls_back_silently() {
+        for response in [
+            json!({"error":{"code":-32000,"message":"module unavailable"}}),
+            json!({"result":"0x12"}),
+        ] {
+            let miner = Address::from_bytes([0x11; 20]);
+            let mut responses = recorded_exchanges()
+                .into_iter()
+                .map(json_response)
+                .collect::<Vec<_>>();
+            responses.push(word_response(
+                "miningPower()",
+                "0x3ec",
+                Uint256::from(0x1234_u64),
+            ));
+            responses.push(power_response(miner, response));
+            let (endpoint, server) = spawn_mock_server(responses);
+            assert!(
+                RpcChainReader::new(endpoint, MINING_CORE, EXPECTED_CHAIN_ID)
+                    .read_classified_state(Some(miner))
+                    .is_err()
+            );
+            server.join().unwrap();
+        }
+    }
+
+    fn power_response(miner: Address, mut response: Value) -> MockResponse {
+        let mut data = function_selector("powerMultiplierWad(uint256,address)");
+        data.push_str(&hex_string(&Uint256::ONE.to_be_bytes())[2..]);
+        data.push_str(&"0".repeat(24));
+        data.push_str(&hex_string(&miner.to_bytes())[2..]);
+        response["jsonrpc"] = json!("2.0");
+        response["id"] = json!(1);
+        MockResponse {
+            expected_request: json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000001234","from":hex_string(&MINING_CORE.to_bytes()),"data":data},"0x3ec"]}),
+            status: 200,
+            body: response.to_string(),
+        }
+    }
+
+    #[test]
     fn classification_values_share_the_accepted_target_block_tag() {
         let mut responses = recorded_exchanges()
             .into_iter()
@@ -769,7 +899,7 @@ mod tests {
         let (endpoint, server) = spawn_mock_server(responses);
 
         let snapshot = RpcChainReader::new(endpoint, MINING_CORE, EXPECTED_CHAIN_ID)
-            .read_classified_state()
+            .read_classified_state(None)
             .expect("base mining state must decode");
         server.join().expect("mock server must finish");
 
@@ -801,7 +931,7 @@ mod tests {
         let (endpoint, server) = spawn_mock_server(responses);
 
         let snapshot = RpcChainReader::new(endpoint, MINING_CORE, EXPECTED_CHAIN_ID)
-            .read_classified_state()
+            .read_classified_state(None)
             .expect("classification failure must not discard usable mining state");
         server.join().expect("mock server must finish");
 

@@ -456,7 +456,7 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
             );
         }
     }
-    let resolved = resolve_mine_state(&args)?;
+    let resolved = resolve_mine_state(&args, miner)?;
     let challenge_inputs = resolved.challenge_inputs;
     let target = resolved.target;
     let state_source = resolved.state_source;
@@ -651,7 +651,7 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
             json,
         );
     }
-    let classified_state = reader.read_classified_state()?;
+    let classified_state = reader.read_classified_state(Some(miner))?;
     let state = classified_state.state;
     let digest = proof_digest(&ProofInputs {
         chain_id: state.challenge_inputs.chain_id,
@@ -662,7 +662,12 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
         nonce: mining_nonce,
     });
     let classification = classify_proof(digest, &classified_state.nft_classification);
-    if !check_proof(&state.challenge_inputs, miner, mining_nonce, state.target) {
+    if !check_proof(
+        &state.challenge_inputs,
+        miner,
+        mining_nonce,
+        classified_state.effective_target,
+    ) {
         return rejected_submission(
             "mining nonce does not satisfy the current target".to_owned(),
             miner,
@@ -1123,7 +1128,10 @@ struct ResolvedMineState {
     nft_classification: Result<NftClassificationSnapshot, String>,
 }
 
-fn resolve_mine_state(args: &MineArgs) -> Result<ResolvedMineState, String> {
+fn resolve_mine_state(
+    args: &MineArgs,
+    miner: proof_core::Address,
+) -> Result<ResolvedMineState, String> {
     if let Some(endpoint) = &args.rpc_url {
         if args.state_file.is_some() {
             return Err("--rpc-url cannot be combined with --state-file".to_owned());
@@ -1143,10 +1151,10 @@ fn resolve_mine_state(args: &MineArgs) -> Result<ResolvedMineState, String> {
             "--mining-core",
         )?;
         let classified = RpcChainReader::new(endpoint, mining_core, expected_chain_id)
-            .read_classified_state()?;
+            .read_classified_state(Some(miner))?;
         return Ok(ResolvedMineState {
             challenge_inputs: classified.state.challenge_inputs,
-            target: classified.state.target,
+            target: classified.effective_target,
             state_source: Some(CHAIN_STATE_SOURCE),
             nft_classification: classified.nft_classification,
         });
