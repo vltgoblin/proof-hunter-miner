@@ -48,8 +48,9 @@ inconsistent journal state fails closed. Never delete a pending journal merely
 to bypass this guard; reconcile its transaction first.
 
 Live mining and submission automatically use the core-selected Mining Power module's
-challenge-bound multiplier for the mining wallet. Lock and assign HUNTER to that
-exact address through the app; new assignments apply from the next challenge.
+challenge-bound multiplier for the mining wallet. The HUNTER must be locked and assigned to that exact address in MiningPowerCustody;
+new assignments apply from the next challenge. The current app assignment shortcut
+selects its browser mining wallet, so it does not assign to a different CLI wallet.
 Loose token balances do not boost mining. No assigned power means 1x.
 Continuous search events report the base target, effective target and multiplier.
 A failed power read pauses live search rather than silently guessing a multiplier. `schedule` and `--state-file` remain legacy offline

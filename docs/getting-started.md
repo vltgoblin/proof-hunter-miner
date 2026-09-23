@@ -72,7 +72,7 @@ The native `--loop` option has no total-run spending cap. Do not treat the per-t
 
 ## Mining Power and agents
 
-The CLI automatically uses Mining Power assigned to its mining wallet. Lock and assign HUNTER through the app to the exact address printed by `bproof wallet address`. New assignments apply from the next challenge; loose balances do not count. No assignment means 1x. Continuous `searchStarted` events report `baseTarget`, effective `target`, and `powerMultiplierWad` (1e18 = 1x). The CLI does not sign token approvals, deposits or assignments.
+The CLI automatically uses Mining Power assigned to its mining wallet. HUNTER must be deposited in MiningPowerCustody and assigned to the exact address printed by `bproof wallet address`. The app’s current assignment shortcut selects its browser mining wallet; it cannot target a different CLI wallet. New assignments apply from the next challenge; loose balances do not count. No assignment means 1x. Continuous `searchStarted` events report `baseTarget`, effective `target`, and `powerMultiplierWad` (1e18 = 1x). The CLI does not sign token approvals, deposits or assignments.
 
 An agent needs an explicitly selected network, a bounded run count and a spending limit. Never paste a private key, passphrase or recovery phrase into chat. The agent skill is operating guidance, not an isolation boundary or evidence of a released binary.
 
@@ -87,3 +87,19 @@ python3 proof-hunters --network mainnet mine --confirm-mainnet --keystore ./main
 
 This performs at most one proof submission. The fee is an example, not a recommended
 spend. It never silently switches networks. A failed proof search can return no NFT.
+
+## Assign power to a CLI wallet
+
+Check the CLI wallet address first. Using your funding wallet and a contract interface
+that lets you choose the mining recipient, the contract sequence is:
+
+1. Approve the verified MiningPowerCustody address to spend the exact HUNTER amount.
+2. Call `deposit(amount)` on that custody from the funding wallet.
+3. Call `assign(cliMiningWallet, amount)` from the same funding wallet.
+
+Use raw token units (HUNTER has 18 decimals). Read the custody address from the
+verified core's `miningPower()` and verify its `HUNTER()` matches the canonical
+token before approving. Keep the funding wallet distinct from the mining wallet.
+The existing app button targets the browser wallet, so do not use it for a
+different CLI address. The CLI itself does not sign these custody transactions.
+Once assigned and eligible, `mine` uses the boost automatically.
