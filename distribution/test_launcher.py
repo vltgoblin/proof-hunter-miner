@@ -52,6 +52,8 @@ class LauncherTests(unittest.TestCase):
   command=m.prepare(self.args,lambda u,k,p:hex(4663) if k=='eth_chainId' else '0x6000')
   self.assertEqual(command[command.index('--chain-id')+1],'4663');self.assertNotIn('--keystore',command)
  def test_missing_binary_checksum_rejected(self):
-  self.profile['binarySha256']='';self.save()
-  with self.assertRaisesRegex(ValueError,'Missing release checksum'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
+  for missing in ['',None]:
+   with self.subTest(checksum=missing):
+    self.profile['binarySha256']=missing;self.save()
+    with self.assertRaisesRegex(ValueError,'Missing release checksum'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
 if __name__=='__main__':unittest.main()
