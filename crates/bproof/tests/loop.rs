@@ -160,6 +160,15 @@ fn unreachable_endpoint_uses_growing_backoff_and_stops_cleanly() {
 
 #[test]
 fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
+    loop_acceptance(false);
+}
+
+#[test]
+fn live_anvil_loop_refreshes_expired_seed_then_resumes_proofs() {
+    loop_acceptance(true);
+}
+
+fn loop_acceptance(expire: bool) {
     if !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../contracts")
         .exists()
@@ -235,6 +244,9 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
     );
     assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 1);
     assert_eq!(account_transaction_count(&endpoint, &miner), 0);
+    if expire {
+        rpc(&endpoint, "anvil_mine", json!(["0x200"]));
+    }
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bproof"))
         .args([
@@ -299,11 +311,17 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
         if event["event"] == "summary" && event["reason"] == "requested" {
             requested_summary_seen = true;
         }
+        if event["event"] == "seedRefreshed" {
+            assert!(expire);
+            assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 0);
+            rpc(&endpoint, "anvil_mine", json!(["0x4"]));
+        }
         if event["event"] == "proofAccepted" {
             accepted.push(event.clone());
             if accepted.len() == 1 {
-                // Each accepted proof selects a seed ahead of the current parent block.
-                rpc(&endpoint, "anvil_mine", json!(["0x80"]));
+                // Advance just beyond the three-block seed delay. A 128-block burst
+                // can open multiple rounds while the event consumer sends Ctrl-C.
+                rpc(&endpoint, "anvil_mine", json!(["0x4"]));
             } else if accepted.len() == 2 {
                 send_interrupt(child.id());
                 interrupt_sent = true;
@@ -346,8 +364,8 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
         "stdin summary request was not served"
     );
     assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[0]["challengeId"], "1");
-    assert_eq!(accepted[1]["challengeId"], "2");
+    assert_eq!(accepted[0]["challengeId"], if expire { "2" } else { "1" });
+    assert_eq!(accepted[1]["challengeId"], if expire { "3" } else { "2" });
     assert_ne!(
         accepted[0]["transactionHash"],
         accepted[1]["transactionHash"]
@@ -369,12 +387,25 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
     assert_eq!(summary["summary"]["consecutiveFailures"], "0");
     assert!(decimal(&summary["summary"]["totalFeesPaidWei"]) > 0);
 
-    assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 3);
+    assert_eq!(
+        mining_core_word(&endpoint, "activeChallengeId()"),
+        if expire { 4 } else { 3 }
+    );
     assert_eq!(mining_core_word(&endpoint, "acceptedProofs()"), 2);
     assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 2);
     assert_eq!(token_balance(&endpoint, &nft, &miner), 2);
     assert_eq!(expected_nfts, "2");
-    assert_eq!(account_transaction_count(&endpoint, &miner), 2);
+    assert_eq!(
+        account_transaction_count(&endpoint, &miner),
+        if expire { 3 } else { 2 }
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "seedRefreshed")
+            .count(),
+        usize::from(expire)
+    );
 
     let output = events
         .iter()

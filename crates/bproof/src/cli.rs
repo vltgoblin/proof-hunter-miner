@@ -31,7 +31,8 @@ use crate::parse::{
 };
 use crate::submit::{
     FEE_REFUSAL_EXIT_CODE, FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome,
-    SUBMISSION_WARNING, prepare_submission, recover_pending_submission, send_prepared_submission,
+    SUBMISSION_WARNING, prepare_seed_refresh, prepare_submission, recover_pending_submission,
+    send_prepared_submission,
 };
 use bproof::keystore::{
     PassphraseSource, create_keystore, read_keystore_address, read_passphrase, unlock_keystore,
@@ -209,13 +210,13 @@ struct MineArgs {
     /// Total attempt cap across all workers; omitted means unlimited.
     #[arg(long)]
     max_attempts: Option<String>,
-    /// Submit the single proof found by this mining run.
+    /// Submit one proof, or refresh an expired seed and exit (within --max-fee).
     #[arg(long)]
     submit: bool,
     /// Continuously read, search, simulate, and submit. Requires --submit.
     #[arg(
         long = "loop",
-        long_help = "Continuously read, search, simulate, and submit. Requires --submit. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, rpcRetry, failure, and summary. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
+        long_help = "Continuously read, search, simulate, and submit. Requires --submit. Expired seeds are automatically refreshed within --max-fee, then mining resumes. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, seedRefreshStarted, seedRefreshed, seedRefreshRecovered, seedRefreshFeeRefused, rpcRetry, failure, and summary. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
     )]
     loop_mode: bool,
     /// Milliseconds between live challenge checks; defaults to 1000.
@@ -454,6 +455,44 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
                 recovered.classification_reason,
                 json,
             );
+        }
+        if let Some(expired) = reader.expired_seed()? {
+            let prepared = match prepare_seed_refresh(
+                &reader,
+                chain_id,
+                mining_core,
+                miner,
+                expired,
+                submission.fee_options,
+            )? {
+                PreparationOutcome::Ready(prepared) => *prepared,
+                PreparationOutcome::SimulationRejected { reason } => return Err(reason),
+                PreparationOutcome::FeeRefused(quote) => {
+                    return Ok(RunResult {
+                        output: Zeroizing::new(if json {
+                            serde_json::json!({"status":"feeRefused", "operation":"seedRefresh", "maximumExposureWei":quote.maximum_exposure_wei.to_string(), "feeCeilingWei":quote.fee_ceiling_wei.to_string()}).to_string()
+                        } else {
+                            "Seed refresh refused: maximum exposure exceeds --max-fee".to_owned()
+                        }),
+                        exit_code: FEE_REFUSAL_EXIT_CODE,
+                    });
+                }
+            };
+            let source = submission
+                .passphrase_file
+                .as_deref()
+                .map_or(PassphraseSource::Prompt, PassphraseSource::File);
+            let passphrase = read_passphrase(source, false)?;
+            let wallet = unlock_keystore(&submission.keystore, &passphrase)?;
+            let mined = send_prepared_submission(
+                &reader,
+                &wallet,
+                prepared,
+                &submission.keystore,
+                "seedRefresh",
+                None,
+            )?;
+            return submission_result(mined, miner, "seedRefresh", None, json);
         }
     }
     let resolved = resolve_mine_state(&args, miner)?;
@@ -866,7 +905,13 @@ fn submission_result(
     let quote = mined.fee_quote;
     let output = SubmissionOutput {
         nft_token_id: mined.nft_token_id.map(uint256_to_decimal),
-        status: if mined.succeeded { "mined" } else { "rejected" },
+        status: if !mined.succeeded {
+            "rejected"
+        } else if mined.seed_refresh {
+            "seedRefreshed"
+        } else {
+            "mined"
+        },
         reason: (!mined.succeeded).then(|| {
             "transaction was mined but reverted; the challenge may have moved before inclusion"
                 .to_owned()

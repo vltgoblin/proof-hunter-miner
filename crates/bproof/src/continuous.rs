@@ -17,7 +17,7 @@ use crate::mining::{MiningControl, MiningRequest, MiningResult, mine_with_contro
 use crate::parse::{hex_string, parse_address, uint256_to_decimal};
 use crate::submit::{
     FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome, SUBMISSION_WARNING,
-    prepare_submission, recover_pending_submission, send_prepared_submission,
+    prepare_seed_refresh, prepare_submission, recover_pending_submission, send_prepared_submission,
 };
 
 pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -265,7 +265,7 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
             if let Err(error) = book.add_fee(recovered.mined.fee_paid_wei) {
                 return fatal(&writer, &book, error, 1);
             }
-            if recovered.mined.succeeded {
+            if recovered.mined.succeeded && !recovered.mined.seed_refresh {
                 book.update(|summary| {
                     summary.proofs_accepted += 1;
                     summary.nfts_earned += u64::from(recovered.mined.proof_nft_minted);
@@ -273,7 +273,11 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                 });
             }
             writer.emit(
-                "submissionRecovered",
+                if recovered.mined.seed_refresh {
+                    "seedRefreshRecovered"
+                } else {
+                    "submissionRecovered"
+                },
                 json!({
                     "transactionHash": hex_string(&recovered.mined.transaction_hash.to_bytes()),
                     "miningNonce": uint256_to_decimal(recovered.mined.mining_nonce),
@@ -316,7 +320,88 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
         match marker.status {
             ChallengeStatus::Ended => return clean_stop(&writer, &book, "miningEnded"),
             ChallengeStatus::Stopped => return clean_stop(&writer, &book, "miningStopped"),
-            ChallengeStatus::WaitingForSeed | ChallengeStatus::Expired => {
+            ChallengeStatus::Expired => {
+                let outcome = (|| {
+                    let Some(expired) = reader.expired_seed()? else {
+                        return Ok(None);
+                    };
+                    prepare_seed_refresh(
+                        &reader,
+                        request.chain_id,
+                        request.mining_core,
+                        request.miner,
+                        expired,
+                        request.fee_options,
+                    )
+                    .map(Some)
+                })();
+                match outcome {
+                    Ok(Some(PreparationOutcome::Ready(prepared))) => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return clean_stop(&writer, &book, "interrupt");
+                        }
+                        writer.emit("seedRefreshStarted", json!({"challengeId": uint256_to_decimal(marker.challenge_id), "maximumExposureWei": prepared.fee_quote.maximum_exposure_wei.to_string()}))?;
+                        match send_prepared_submission(
+                            &reader,
+                            &wallet,
+                            *prepared,
+                            &request.keystore,
+                            "seedRefresh",
+                            None,
+                        ) {
+                            Ok(mined) => {
+                                book.add_fee(mined.fee_paid_wei)?;
+                                writer.emit(if mined.succeeded { "seedRefreshed" } else { "seedRefreshReverted" }, json!({"transactionHash": hex_string(&mined.transaction_hash.to_bytes()), "feePaidWei": mined.fee_paid_wei.to_string()}))?;
+                                if mined.succeeded {
+                                    book.update(|summary| summary.consecutive_failures = 0);
+                                } else if repeated_failure(
+                                    &writer,
+                                    &book,
+                                    &shutdown,
+                                    &mut backoff,
+                                    "seed refresh reverted; rechecking the current challenge"
+                                        .to_owned(),
+                                )? {
+                                    return failed_stop(&writer, &book);
+                                }
+                            }
+                            Err(error) => {
+                                // A journal means the send could have succeeded. Never sign a replacement.
+                                if crate::submit::pending_submission_path(&request.keystore)
+                                    .exists()
+                                {
+                                    writer
+                                        .emit("submissionUnresolved", json!({"reason": error}))?;
+                                    return failed_stop(&writer, &book);
+                                }
+                                if repeated_failure(&writer, &book, &shutdown, &mut backoff, error)?
+                                {
+                                    return failed_stop(&writer, &book);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(PreparationOutcome::FeeRefused(quote))) => {
+                        writer.emit("seedRefreshFeeRefused", json!({"maximumExposureWei": quote.maximum_exposure_wei.to_string(), "feeCeilingWei": quote.fee_ceiling_wei.to_string()}))?;
+                    }
+                    Ok(Some(PreparationOutcome::SimulationRejected { reason })) => {
+                        if repeated_failure(&writer, &book, &shutdown, &mut backoff, reason)? {
+                            return failed_stop(&writer, &book);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if !rpc_retry(&writer, &shutdown, &mut backoff, error)? {
+                            return clean_stop(&writer, &book, "interrupt");
+                        }
+                    }
+                }
+                if !wait_interruptibly(request.watch_interval, &shutdown) {
+                    return clean_stop(&writer, &book, "interrupt");
+                }
+                continue;
+            }
+            ChallengeStatus::WaitingForSeed => {
                 writer.emit(
                     "challengeUnavailable",
                     json!({

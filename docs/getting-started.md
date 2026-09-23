@@ -3,13 +3,13 @@
 ## Choose the available mining path
 
 The [browser miner](https://app.proofhunter.fun/app/mine) and mainnet protocol are live.
-Use the **v0.2.2** CLI release or current reviewed source. **v0.1.0 is legacy** and
+Use the **v0.2.3** CLI release or current reviewed source. **v0.1.0 is legacy** and
 must not be used for NFT mining.
 
 ## Download a release bundle
 
 Get `proof-hunters-<system>.zip` and `SHA256SUMS` from
-[the v0.2.2 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.2).
+[the v0.2.3 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.3).
 Choose `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` or
 `windows-x86_64`. Follow [release verification](verifying-a-release.md) before
 extracting or running it. Python 3.9+ is required for the launcher.
@@ -103,3 +103,19 @@ token before approving. Keep the funding wallet distinct from the mining wallet.
 The existing app button targets the browser wallet, so do not use it for a
 different CLI address. The CLI itself does not sign these custody transactions.
 Once assigned and eligible, `mine` uses the boost automatically.
+
+## Automatic seed refresh
+
+Expired seeds are refreshed automatically when `mine --submit` is authorized.
+A one-shot run sends only the refresh, reports `seedRefreshed`, and exits; invoke
+it again after the seed becomes readable to mine. With `--loop`, the miner waits
+for the new seed and resumes itself. Read-only commands never refresh or spend.
+The refresh uses the same per-transaction `--max-fee` ceiling, has zero ETH value,
+and mints no NFT. Another miner can win the refresh race; a reverted transaction
+can still cost gas. Refresh fees are included in the loop's total fees.
+
+An unresolved refresh is journaled before broadcast and reconciled on restart.
+If the seed changed and no receipt is available, recovery refuses to rebroadcast
+stale refresh bytes and keeps the journal for investigation. Never clear it to
+force another transaction. Version 2 journals support proof and refresh calls;
+existing version 1 proof journals remain readable.
