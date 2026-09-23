@@ -1,0 +1,182 @@
+   Compiling bproof v0.2.2 (/home/obanj/Projects/work/mainnet-integration-20260923/miner/crates/bproof)
+    Finished `release` profile [optimized] target(s) in 4.80s
+     Running unittests src/lib.rs (target/release/deps/bproof-a6d799172deb59f0)
+
+running 11 tests
+test keystore::tests::backup_phrase_is_not_written_to_the_keystore ... ok
+test keystore::tests::enabled_core_dumps_are_refused ... ok
+test keystore::tests::every_secret_holding_type_has_redacted_debug_output ... ok
+test keystore::tests::existing_keystore_is_never_overwritten ... ok
+test keystore::tests::generate_write_unlock_round_trip_preserves_address ... ok
+test keystore::tests::passphrase_file_refuses_other_readers_and_accepts_0600 ... ok
+test keystore::tests::secret_names_are_not_sent_to_logging_or_panic_macros ... ok
+test keystore::tests::wrong_passphrase_and_malformed_keystore_have_the_same_error ... ok
+test transaction::tests::chain_id_is_inside_the_typed_signing_payload ... ok
+test transaction::tests::rlp_uses_canonical_integer_and_length_encodings ... ok
+test transaction::tests::submit_proof_calldata_has_the_recorded_selector_and_four_words ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+
+     Running unittests src/main.rs (target/release/deps/bproof-0ce708867da9c8b1)
+
+running 48 tests
+test chain::tests::address_without_code_fails_closed ... ok
+test chain::tests::arbitrum_parent_blockhash_uses_evm_helper_not_l2_block_namespace ... ok
+test chain::tests::classification_values_share_the_accepted_target_block_tag ... ok
+test chain::tests::failed_classification_read_preserves_state_and_reports_unknown ... ok
+test chain::tests::genuinely_wrong_challenge_still_fires_the_mismatch_guard ... ok
+test chain::tests::http_500_is_clear_and_does_not_panic ... ok
+test chain::tests::json_rpc_error_object_is_clear_and_does_not_panic ... ok
+test chain::tests::live_anvil_deployment_matches_the_contract_state ... live Anvil integration ran against http://127.0.0.1:35863
+ok
+test chain::tests::mining_power_reads_share_snapshot_and_classify_bonus_proofs_as_nfts ... ok
+test chain::tests::non_json_body_is_clear_and_does_not_panic ... ok
+test chain::tests::oversized_chunked_rpc_body_is_rejected_while_streaming ... ok
+test chain::tests::oversized_declared_rpc_body_is_rejected_before_reading_it ... ok
+test chain::tests::power_rpc_failure_or_malformed_word_never_falls_back_silently ... ok
+test chain::tests::recorded_rpc_pairs_decode_every_mining_field ... ok
+test chain::tests::seed_availability_uses_evm_parent_number_not_l2_snapshot_height ... ok
+test chain::tests::truncated_call_result_is_clear_and_does_not_panic ... ok
+test chain::tests::unreachable_endpoint_is_clear_and_does_not_panic ... ok
+test chain::tests::wrong_chain_id_fails_closed ... ok
+test chain::tests::zero_evm_blockhash_reports_the_challenge_unavailable ... ok
+test classification::tests::accepted_target_controls_classification_not_a_later_target ... ok
+test classification::tests::collection_cap_changes_a_qualifying_digest_to_ordinary ... ok
+test classification::tests::division_matches_wide_uint256_boundaries ... ok
+test classification::tests::failed_required_read_is_unknown_not_ordinary ... ok
+test classification::tests::threshold_is_inclusive_and_one_above_is_ordinary ... ok
+test cli::tests::ordinary_fee_refusal_does_not_claim_a_proof_hunter_was_lost ... ok
+test cli::tests::proof_hunter_fee_refusal_names_the_path_and_exact_accepting_ceiling ... ok
+test cli::tests::secret_output_types_have_redacted_debug_output ... ok
+test continuous::tests::backoff_doubles_and_stays_capped ... ok
+test continuous::tests::challenge_watcher_stops_a_live_search_when_the_chain_moves ... ok
+test continuous::tests::clean_completion_is_exit_zero_and_has_every_summary_field ... ok
+test continuous::tests::fee_refusal_counters_move_independently ... ok
+test continuous::tests::normal_outcomes_clear_failures_without_incrementing_them ... ok
+test continuous::tests::proof_hunter_fee_refusal_says_the_whole_reward_is_forfeited ... ok
+test continuous::tests::seed_refresh_abandons_work_without_counting_a_miner_race ... ok
+test continuous::tests::summary_never_contains_secret_material ... ok
+test mining::tests::watcher_abandons_stale_work_and_a_new_challenge_can_start ... ok
+test power::tests::base_fractional_cap_and_solidity_rounding_boundary ... ok
+test power::tests::full_width_multiplication_does_not_wrap ... ok
+test submit::tests::error_disambiguation_never_leaves_a_plain_transaction_count_name ... ok
+test submit::tests::fee_ceiling_is_compared_to_maximum_exposure_inclusively ... ok
+test submit::tests::pending_submission_journal_fails_closed_on_open_permissions ... ok
+test submit::tests::pending_submission_journal_refuses_symlinks ... ok
+test submit::tests::pending_submission_journal_rejects_tampered_fee_authority ... ok
+test submit::tests::pending_submission_journal_round_trips_and_refuses_overwrite ... ok
+test submit::tests::recorded_fee_formula_and_margin_bound_total_exposure ... ok
+test submit::tests::stale_challenge_simulation_is_rejected_before_any_send_request ... ok
+test submit::tests::successful_receipt_requires_the_exact_locally_prepared_proof_event ... ok
+test submit::tests::unreachable_simulation_is_an_rpc_failure_not_a_proof_rejection ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.28s
+
+     Running tests/cli.rs (target/release/deps/cli-9b34d511ada8430c)
+
+running 19 tests
+test file_sourced_human_outputs_and_help_are_explicitly_offline ... ok
+test file_state_errors_name_missing_unknown_and_malformed_keys ... ok
+test four_thread_stride_partition_reports_nonce_37 ... ok
+test full_width_hex_nonce_is_emitted_as_a_decimal_string ... ok
+test live_status_and_mine_are_always_labelled_chain_while_file_stays_file ... ok
+test malformed_address_exits_two_without_stdout_or_panic ... ok
+test malformed_digest_exits_two_without_stdout_or_panic ... ok
+test mine_all_ff_finds_the_start_nonce_and_round_trips_through_verify ... ok
+test mine_exhausts_one_total_budget_across_all_threads ... ok
+test rpc_url_clashes_with_file_and_each_manual_state_flag ... ok
+test schedule_next_json_has_exact_values_and_keys ... ok
+test schedule_summary_json_has_the_five_landing_facts ... ok
+test single_thread_mining_is_deterministic_at_nonce_37 ... ok
+test state_file_and_state_flag_clash_exits_two ... ok
+test state_file_mine_matches_flag_mine_except_for_required_source_label ... ok
+test status_from_sample_file_has_exact_state_reward_and_source_fields ... ok
+test top_level_help_documents_all_exit_codes ... ok
+test verify_accepts_a_digest_equal_to_the_target ... ok
+test verify_rejects_a_target_one_below_the_digest_with_exit_one ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/loop.rs (target/release/deps/loop-0119dd1d8913a8fd)
+
+running 3 tests
+test live_anvil_loop_accepts_two_proofs_then_stops_cleanly ... live Anvil loop transaction hashes: 0x869846bc1e55b5f09aaa364fec61ac16909807958aa9ddc8eaaa5b236360e18e, 0x9b14a686fe633649a14ee38d07fbed984612c2756f3a97c09c3da318350a1617
+ok
+test loop_requires_explicit_submission_and_documents_streaming_events ... ok
+test unreachable_endpoint_uses_growing_backoff_and_stops_cleanly ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.96s
+
+     Running tests/submit.rs (target/release/deps/submit-ff1d5b622587591a)
+
+running 6 tests
+test help_documents_submission_exit_codes_and_explicit_nonce_names ... ok
+test live_anvil_assigned_power_mines_bonus_nonce_only_from_next_challenge ... Mining Power local acceptance: pending=1x; next challenge=2x; bonus digest submitted; NFT ownership verified
+ok
+test live_anvil_mines_and_submits_one_real_proof ... live Anvil submission and restarted wallet verified: 0x080f5d589685beb61228a7314897f2b8b18026e85c08187f9c71e91931c779bb
+ok
+test lost_send_reply_recovers_exact_signed_transaction_before_new_mining ... ok
+test mine_submit_requires_an_explicit_total_fee_ceiling ... ok
+test submit_requires_an_explicit_total_fee_ceiling ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.49s
+
+     Running tests/wallet.rs (target/release/deps/wallet-5e391d20b73873cc)
+
+running 4 tests
+test environment_passphrase_is_refused_without_reading_its_value ... ok
+test wallet_new_refuses_to_overwrite_an_existing_path ... ok
+test wallet_new_stores_phrase_only_in_owner_only_recovery_file ... ok
+test wallet_surface_has_no_import_or_existing_key_path ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+     Running unittests src/lib.rs (target/release/deps/proof_core-81079c6923f38848)
+
+running 16 tests
+test proof::tests::a_nonce_valid_for_one_wallet_fails_for_another_wallet ... ok
+test proof::tests::challenge_matches_independent_abi_encoding_and_is_deterministic ... ok
+test proof::tests::recorded_typehashes_recompute_from_the_canonical_strings ... ok
+test proof::tests::target_comparison_is_inclusive_at_equality ... ok
+test proof::tests::two_full_proof_vectors_match_independent_abi_encoding ... ok
+test proof::tests::uint256_wrapping_add_handles_plain_carry_chain_and_wrap ... ok
+test schedule::tests::divisor_uses_the_pre_acceptance_index_and_stops_at_the_final_value ... ok
+test schedule::tests::exhausted_or_invalid_supply_has_no_reward ... ok
+test schedule::tests::first_proof_uses_the_opening_divisor ... ok
+test schedule::tests::full_schedule_lands_on_the_decided_cap_exactly ... ok
+test schedule::tests::reserve_equals_whole_reward_at_required_edges ... ok
+test schedule::tests::reward_is_clipped_to_remaining_capacity ... ok
+test schedule::tests::zero_reward_has_zero_reserve ... ok
+test search::tests::engine_exhausts_the_exact_budget_for_an_impossible_target ... ok
+test search::tests::engine_finds_the_first_known_nonce_with_an_exact_attempt_count ... ok
+test search::tests::four_stride_sequences_cover_exactly_the_first_hundred_nonces ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+
+     Running tests/prepared_proof.rs (target/release/deps/prepared_proof-f4fb0345a2871fb3)
+
+running 1 test
+test prepared_hash_matches_reference_across_domains_and_nonce_boundaries ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/schedule_cross_impl.rs (target/release/deps/schedule_cross_impl-44aa413739d7b955)
+
+running 2 tests
+test reserve_equals_whole_reward ... ok
+test whole_lifetime_agrees_with_solidity_and_python ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+   Doc-tests bproof
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests proof_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
