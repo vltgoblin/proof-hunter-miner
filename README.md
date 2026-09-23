@@ -57,7 +57,7 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
 The mainnet protocol is live and its public addresses/runtime hashes are recorded
-in the mainnet profile. Source profile templates stay disabled. The v0.2.0 release bundles contain a
+in the mainnet profile. Source profile templates stay disabled. The v0.2.1 release bundles contain a
 matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
 Mainnet mining through a released launcher requires explicit confirmation.
 
@@ -72,10 +72,10 @@ agent's skill directory. It uses bounded mining calls and an explicit gas ceilin
 
 ## Release status
 
-**Mainnet: live on Robinhood Chain (4663).** Download the current **v0.2.0**
-package from [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.0)
+**Mainnet: live on Robinhood Chain (4663).** Download the current **v0.2.1**
+package from [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.1)
 and verify its checksum and build attestation before use. The older **v0.1.0 is
-legacy** and must not be used for mainnet NFT mining. If v0.2.0 is not available,
+legacy** and must not be used for mainnet NFT mining. If v0.2.1 is not available,
 build the current source; never substitute a v0.1.0 binary.
 
 Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and

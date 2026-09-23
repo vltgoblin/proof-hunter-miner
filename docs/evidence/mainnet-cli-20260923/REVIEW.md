@@ -9,3 +9,7 @@
 - Native unit tests and clippy passed. Launcher/package tests passed (15). Canonical contract-backed acceptance passed 105 tests with zero skip messages, including two-proof continuous mining, real local funding, NFT ownership after restart, and exact signed-transaction recovery after a lost reply. Foundry 1.7.1 used isolated local Anvil nodes. Release asset verification remains separate.
 
 Fresh Linux v0.2.0 bundle preflight and native read-only status passed against mainnet chain 4663, reporting nftOnly settlement, challenge 5 and 3 minted NFTs. No wallet or public-chain transaction was used. The launcher identifies itself as ProofHuntersCLI/0.2.0 because the public provider rejects Python’s default user agent (HTTP 403); a regression test covers the request header.
+
+## Release audit correction
+
+v0.2.0 was not published: its release audit rejected rustls 0.23.43 under RUSTSEC-2026-0285. v0.2.1 upgrades only that dependency to patched 0.23.45. The failed tag is retained unchanged; no v0.2.0 binary assets were released. Existing v0.2.0 read-only smoke evidence above describes the pre-audit candidate, not final downloadable artifacts.

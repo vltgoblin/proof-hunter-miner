@@ -60,7 +60,7 @@ class LauncherTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError,'Missing release checksum'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
  def test_rpc_identifies_cli_to_public_provider(self):
   def respond(request, timeout):
-   self.assertEqual(request.get_header('User-agent'),'ProofHuntersCLI/0.2.0')
+   self.assertEqual(request.get_header('User-agent'),'ProofHuntersCLI/0.2.1')
    self.assertEqual(json.loads(request.data)['method'],'eth_chainId')
    return io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":"0x1237"}')
   with patch.object(m.urllib.request,'urlopen',side_effect=respond):

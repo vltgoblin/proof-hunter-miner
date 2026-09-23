@@ -3,13 +3,13 @@
 ## Choose the available mining path
 
 The [browser miner](https://app.proofhunter.fun/app/mine) and mainnet protocol are live.
-Use the **v0.2.0** CLI release or current reviewed source. **v0.1.0 is legacy** and
+Use the **v0.2.1** CLI release or current reviewed source. **v0.1.0 is legacy** and
 must not be used for NFT mining.
 
 ## Download a release bundle
 
 Get `proof-hunters-<system>.zip` and `SHA256SUMS` from
-[the v0.2.0 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.0).
+[the v0.2.1 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.1).
 Choose `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` or
 `windows-x86_64`. Follow [release verification](verifying-a-release.md) before
 extracting or running it. Python 3.9+ is required for the launcher.
