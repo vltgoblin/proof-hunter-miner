@@ -62,7 +62,7 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
 The mainnet protocol is live and its public addresses/runtime hashes are recorded
-in the mainnet profile. Source profile templates stay disabled. The v0.2.2 release bundles will contain a
+in the mainnet profile. Source profile templates stay disabled. The v0.2.2 release bundles contain a
 matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
 Mainnet mining through a released launcher requires explicit confirmation.
 
@@ -77,15 +77,17 @@ agent's skill directory. It uses bounded mining calls and an explicit gas ceilin
 
 ## Release status
 
-**Mainnet: live on Robinhood Chain (4663).** The **v0.2.2** download is being prepared.
-Build the current source now, or check [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases).
+**Mainnet: live on Robinhood Chain (4663).** [Download v0.2.2](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.2), including assigned HUNTER mining power.
 Verify download checksums and build attestations before use. The older **v0.1.0 is
-legacy** and must not be used for mainnet NFT mining. If v0.2.2 is not available,
-build the current source; never substitute a v0.1.0 binary.
+legacy** and must not be used for mainnet NFT mining.
 
 Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and
 mainnet configuration. The raw `bproof-*` files are also available for users who
 supply the explicit network options themselves. Read [the setup guide](docs/getting-started.md).
+
+**Expired challenge seeds:** continuous mining waits for an external seed refresh;
+this CLI does not send that refresh transaction. Read-only `status` may report
+`challenge unavailable` until the seed is refreshed.
 
 The approximately month-long collection model is a population scenario, not a
 promise about one miner or the completion date.
