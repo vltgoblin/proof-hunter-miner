@@ -1,15 +1,15 @@
 # Proof Hunters network launcher
 
-Release candidate tooling, not a cleared public miner. Requires Python 3.9+ and
-a matching native `bproof` binary. Both shipped profiles are disabled until their
-network acceptance completes. This wrapper leaves the core miner unchanged.
+Requires Python 3.9+ and the native `bproof` binary included in the release bundle.
+Mainnet is live on chain 4663. The v0.2.0 bundles pin each platform binary and the
+deployed contract bytecode. Source templates remain disabled; testnet is disabled.
 
 ## Commands
 
 ```sh
-./proof-hunters --network testnet profile
-./proof-hunters --network testnet status
-./proof-hunters --network testnet mine --keystore ./testnet-wallet.json --max-fee-wei 100000000000000 --max-attempts 1000000
+./proof-hunters --network mainnet profile
+./proof-hunters --network mainnet status
+./proof-hunters --network mainnet mine --confirm-mainnet --keystore ./mainnet-wallet.json --max-fee-wei 100000000000000 --max-attempts 1000000
 ```
 
 The fee above is a syntax example, not a recommended budget. The limit is per
@@ -18,30 +18,24 @@ Use `bproof wallet new --help` to create a dedicated encrypted wallet. Never put
 private keys or passphrases in profiles or command arguments. Do not delete a
 pending transaction journal to retry a transfer.
 
-## Release activation
+## Mainnet protocol is live; package activation remains separate
 
-1. Freeze and test the exact RC2 source and native binary in the main release
-   workstream. Complete the controlled testnet deployment and required pilot.
-2. Populate `profiles/testnet.json` from the accepted deployment: chain ID, public
-   HTTPS RPC, mining core, basket, and SHA-256 hashes of their raw runtime bytecode.
-   Hash decoded bytes, not the hexadecimal text.
-3. Package the matching native binary as `bproof`. Its SHA-256 must equal
-   `binarySha256`. Publish separate packages and checksums per operating system
-   and architecture. Set `ready: true` only after acceptance; remove the blocker
-   reason. The profile is public configuration, not an authenticity signature.
-4. Run launcher status and one owner-authorized bounded proof; verify the NFT's
-   canonical receipt and ownership. Then publish the accepted release/checksums
-   and update the public download page. Do not label candidate archives as ready.
+`profiles/mainnet.json` records chain 4663, the live mining core, admitted NVDA
+basket and SHA-256 hashes of decoded runtime bytecode. Its `ready` flag stays
+false and `binarySha256` stays empty until a matching current binary is packaged
+and verified. This is a CLI distribution limit, not a mainnet launch gate.
+The old v0.1.0 binary must not be used to fill this gap.
 
-## Mainnet later
+For each released OS/architecture, package the matching `bproof` binary with its
+own profile/checksum and publish build provenance. Confirm local-contract tests
+and read-only mainnet status against the exact source. Any mainnet submission
+still needs the user's explicit spending authorization and `--confirm-mainnet`.
+Do not edit `ready` or use a guessed checksum to bypass a missing release.
 
-Keep the same command interface, selecting `--network mainnet`. Populate the
-separate mainnet profile from its own accepted deployment and code hashes, never
-from the testnet profile. Mainnet mining additionally requires
-`--confirm-mainnet`. Use a separately funded wallet/journal. There is no automatic
-RPC fallback or testnet-to-mainnet switch. A missing/unapproved profile refuses
-before any wallet is opened. A user editing a profile can change these checks;
-the launcher is not a substitute for trusting the release distributor and RPC.
+Use `--network mainnet` for this deployment; the default remains testnet to
+avoid silently changing an existing command's spending network. There is no
+RPC fallback or automatic testnet-to-mainnet switch. Profiles are configuration,
+not signatures or independent chain proofs. Use separate wallet journals per network.
 
 ## Agent skill
 
@@ -55,4 +49,4 @@ an Anthropic API key. An agent skill is instructions, not a key-isolation sandbo
 `python3 -m unittest discover -s distribution -p 'test_*.py'`
 
 Tests use dummy binaries and mocked RPC. They do not establish native miner or
-public-chain acceptance. Public profiles intentionally remain disabled.
+public-chain acceptance. Source templates remain disabled; `package_release.py` creates a separate mainnet profile bound to the bundled binary.

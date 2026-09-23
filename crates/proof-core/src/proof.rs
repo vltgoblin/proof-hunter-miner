@@ -232,6 +232,36 @@ pub fn proof_digest(inputs: &ProofInputs) -> Digest {
     keccak256(&proof_preimage(inputs))
 }
 
+/// Reuses the fixed 224-byte proof prefix across nonce attempts.
+///
+/// This is the same Keccak computation as `proof_digest`: the cached state
+/// includes the complete first absorption block and the buffered prefix tail.
+/// Only the final ABI word (nonce) varies; no domain or target rule changes.
+#[derive(Clone)]
+pub struct PreparedProof {
+    prefix: Keccak256,
+}
+
+impl PreparedProof {
+    #[must_use]
+    pub fn new(inputs: &ProofInputs) -> Self {
+        let preimage = proof_preimage(inputs);
+        let mut prefix = Keccak256::new();
+        prefix.update(&preimage[..PREIMAGE_BYTES - ABI_WORD_BYTES]);
+        Self { prefix }
+    }
+
+    #[must_use]
+    pub fn digest(&self, nonce: Uint256) -> Digest {
+        let mut hasher = self.prefix.clone();
+        hasher.update(nonce.to_be_bytes());
+        let hash = hasher.finalize();
+        let mut bytes = [0; ABI_WORD_BYTES];
+        bytes.copy_from_slice(&hash);
+        Digest(bytes)
+    }
+}
+
 /// Returns whether the digest satisfies the inclusive proof target.
 #[must_use]
 pub fn meets_target(digest: Digest, target: Target) -> bool {

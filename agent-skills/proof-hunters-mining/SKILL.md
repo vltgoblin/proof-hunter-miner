@@ -12,5 +12,7 @@ Use the release's `proof-hunters` launcher and its matching `bproof` binary. Fir
 5. Report actual JSON output: searching, exhausted, fee refused, pending, confirmed NFT ID, or failure. Searching is not a mint. Mining creates a Hunter NFT, not HUNTER tokens. The `schedule` command is legacy and must not be used to estimate live rewards.
 6. If submission is unresolved, retain the keystore's durable journal. Retry through the same CLI and wallet so it reconciles the signed transaction; never delete the journal, guess a matching transaction, or create a fresh wallet to bypass it. Ctrl-C stops the foreground process. A stopped process may still have a submitted transaction.
 
-## Mainnet transition
+## Live mainnet and release availability
 Use `--network mainnet` only after the user explicitly selects mainnet and a released, verified mainnet profile exists. Mining also requires `--confirm-mainnet`. Separate network keystores/journals are recommended. Testnet authorization does not authorize mainnet spending. Profiles are public release configuration, never credentials; do not invent mainnet addresses or copy testnet addresses. Keep reporting mainnet as unavailable while its profile is disabled.
+
+Mainnet protocol is live on chain 4663. Use a verified v0.2.0 release bundle with its binary checksum; source profile templates remain disabled. For current public settings use https://app.proofhunter.fun/release.json. The current native search uses base power, not the assigned Mining Power boost. The standalone source is intended for public inspection; verify actual repository and release availability before claiming an install succeeded.

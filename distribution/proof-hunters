@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 
 def rpc(url, method, params):
-    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json'})
+    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json','User-Agent':'ProofHuntersCLI/0.2.0'})
     with urllib.request.urlopen(request, timeout=20) as response:
         result = json.load(response)
     if 'error' in result or 'result' not in result:
@@ -30,6 +30,8 @@ def prepare(args, call=rpc):
         raise ValueError('Invalid chain ID')
     if args.network == 'testnet' and profile['chainId'] != 46630:
         raise ValueError('Testnet profile must use chain 46630')
+    if args.network == 'mainnet' and profile['chainId'] != 4663:
+        raise ValueError('Mainnet profile must use chain 4663')
     url = urlsplit(profile['rpcUrl'])
     if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
         raise ValueError('Profile RPC must use HTTPS without embedded credentials')
@@ -37,9 +39,9 @@ def prepare(args, call=rpc):
         if not re.fullmatch(r'0x[0-9a-fA-F]{40}',profile[key]) or int(profile[key],16)==0:
             raise ValueError('Invalid '+key)
     for key in ['coreCodeSha256','basketCodeSha256','binarySha256']:
-        if not re.fullmatch(r'[0-9a-f]{64}',profile[key]):
+        if not isinstance(profile.get(key),str) or not re.fullmatch(r'[0-9a-f]{64}',profile[key]):
             raise ValueError('Missing release checksum: '+key)
-    binary = ROOT/'bproof'
+    binary = ROOT/('bproof.exe' if os.name == 'nt' else 'bproof')
     if not binary.is_file() or hashlib.sha256(binary.read_bytes()).hexdigest()!=profile['binarySha256']:
         raise ValueError('CLI binary does not match the cleared release checksum')
     if int(call(profile['rpcUrl'],'eth_chainId',[]),16)!=profile['chainId']:

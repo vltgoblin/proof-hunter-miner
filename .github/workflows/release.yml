@@ -54,6 +54,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      - name: Test release launcher and packaging
+        run: python3 -m unittest discover -s distribution -p 'test_*.py'
+
       - name: Install pinned dependency scanners
         shell: bash
         run: |
@@ -185,10 +188,22 @@ jobs:
             throw "Staged binary checksum changed"
           }
 
+      - name: Package the network launcher
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          TARGET_NAME: ${{ matrix.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 distribution/package_release.py --binary "dist/$ASSET_NAME" --target "$TARGET_NAME" --output "dist/proof-hunters-$TARGET_NAME.zip"
+          python3 -c 'import hashlib,pathlib; p=pathlib.Path("dist"); files=sorted(f for f in p.iterdir() if f.name!="SHA256SUMS"); (p/"SHA256SUMS").write_text("".join(hashlib.sha256(f.read_bytes()).hexdigest()+"  "+f.name+"\n" for f in files))'
+
       - name: Attest the binary
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: dist/${{ matrix.asset }}
+          subject-path: |
+            dist/${{ matrix.asset }}
+            dist/proof-hunters-${{ matrix.name }}.zip
 
       - name: Upload the dry-run release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -196,6 +211,7 @@ jobs:
           name: release-${{ matrix.name }}
           path: |
             dist/${{ matrix.asset }}
+            dist/proof-hunters-${{ matrix.name }}.zip
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
@@ -236,6 +252,8 @@ jobs:
             exit 1
           fi
 
+          bundle_count=$(find dist -maxdepth 1 -type f -name 'proof-hunters-*.zip' | wc -l | tr -d ' ')
+          test "$bundle_count" -eq 5
           (cd dist && sha256sum -c SHA256SUMS)
 
       - name: Attest the checksum manifest
