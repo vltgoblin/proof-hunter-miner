@@ -15,8 +15,8 @@ target/release/bproof wallet new --help
 
 Create a dedicated encrypted mining wallet using `wallet new`. Keep the recovery
 file private. The CLI signs with that wallet, not the browser's MetaMask account.
-Use an approved deployment's chain ID, core and admitted basket addresses. Do not
-copy addresses from test fixtures into a public deployment.
+Phase 1 is live on Robinhood mainnet (4663). Use the verified settings in
+[the setup guide](docs/getting-started.md); do not use RC1/RC2 fixtures.
 
 ```sh
 target/release/bproof status \
@@ -47,8 +47,8 @@ receipt before allowing a new transaction. Corrupt, overly permissive, or
 inconsistent journal state fails closed. Never delete a pending journal merely
 to bypass this guard; reconcile its transaction first.
 
-The search uses the core's base target. It does not optimize mining for an attached
-NFT's boosted effective target. `schedule` and `--state-file` remain legacy offline
+The search uses the core's base target. It does not yet search Mining Power's boosted
+effective target for HUNTER assigned to a mining wallet. `schedule` and `--state-file` remain legacy offline
 calculation tools; their token schedule is not the current live settlement model.
 
 See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
@@ -56,8 +56,10 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 ## Network profiles and AI agents
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
-Both profiles are disabled pending acceptance. Mainnet uses its own verified
-configuration and explicit confirmation; it never inherits testnet addresses.
+The mainnet protocol is live and its public addresses/runtime hashes are recorded
+in the mainnet profile. Source profile templates stay disabled. The v0.2.0 release bundles contain a
+matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
+Mainnet mining through a released launcher requires explicit confirmation.
 
 ```sh
 python3 distribution/proof-hunters --network testnet profile
@@ -70,11 +72,18 @@ agent's skill directory. It uses bounded mining calls and an explicit gas ceilin
 
 ## Release status
 
-This source update is an RC2 candidate. The existing **v0.1.0 release is legacy**
-and is not the NFT-only RC2 miner. Do not use its old contract addresses for RC2.
-No accepted RC2 binary or active network profile is supplied by this change.
-The approximate 30-day collection model is a calibration target, not a promise
-about an individual miner or completion date.
+**Mainnet: live on Robinhood Chain (4663).** Download the current **v0.2.0**
+package from [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.0)
+and verify its checksum and build attestation before use. The older **v0.1.0 is
+legacy** and must not be used for mainnet NFT mining. If v0.2.0 is not available,
+build the current source; never substitute a v0.1.0 binary.
+
+Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and
+mainnet configuration. The raw `bproof-*` files are also available for users who
+supply the explicit network options themselves. Read [the setup guide](docs/getting-started.md).
+
+The approximately month-long collection model is a population scenario, not a
+promise about one miner or the completion date.
 
 Standalone Rust checks skip production-contract integration tests when the
 monorepo contracts are absent. Those tests must also pass in the canonical
@@ -84,3 +93,14 @@ See [source provenance](docs/source-snapshot.json) and
 
 [Website](https://proofhunter.fun) · [App](https://app.proofhunter.fun) ·
 [Documentation](https://doc.proofhunter.fun)
+
+## Performance and fair mining
+
+Workers search disjoint nonce ranges in 16,384-attempt batches. The native search
+caches the fixed proof prefix, then hashes each nonce against the same canonical
+Keccak and target rules. The optimization does not change difficulty, NFT supply,
+challenge timing or HUNTER rules. Shared proof-vector tests protect compatibility
+with browser proofs. Stronger hardware can search more nonces; equal rules do not
+promise equal wins per device. The browser remains a valid mining path.
+
+[An early signal](DISCOVER.md)

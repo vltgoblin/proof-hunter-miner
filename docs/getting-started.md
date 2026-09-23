@@ -1,51 +1,88 @@
-# Set up and fund your miner
+# Mainnet wallet and mining setup
 
-RC2 is a candidate. Wait for an accepted release and enabled testnet profile before
-sending funds for this release. Old v0.1.0 binaries target the previous model.
+## Choose the available mining path
 
-## 1. Create a mining wallet
+The [browser miner](https://app.proofhunter.fun/app/mine) and mainnet protocol are live.
+Use the **v0.2.0** CLI release or current reviewed source. **v0.1.0 is legacy** and
+must not be used for NFT mining.
 
-From the verified release directory:
+## Download a release bundle
 
-```sh
-./bproof wallet new --keystore ./testnet-wallet.json --recovery-out ./testnet-recovery.txt
-./bproof wallet address --keystore ./testnet-wallet.json --json
-```
+Get `proof-hunters-<system>.zip` and `SHA256SUMS` from
+[the v0.2.0 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.0).
+Choose `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` or
+`windows-x86_64`. Follow [release verification](verifying-a-release.md) before
+extracting or running it. Python 3.9+ is required for the launcher.
 
-Enter your passphrase locally. Keep the recovery file offline and private. The
-address is public; do not share the keystore, passphrase, or recovery words.
-
-## 2. Transfer test ETH
-
-In MetaMask, select Robinhood Chain Testnet (chain 46630). Send test ETH to the
-address printed above. Check the full destination and network before confirming.
-Wait for the transfer receipt. The CLI does not pull funds from MetaMask or need
-an allowance. The selected basket is proof configuration, not the gas currency;
-you do not need to transfer basket tokens merely to pay mining gas.
-
-Use your wallet or the network explorer to check that the mining address received
-the ETH. The CLI currently has no dedicated funding or balance command.
-
-## 3. Set the fee ceiling and mine
+Inside the extracted `proof-hunters` folder:
 
 ```sh
-./proof-hunters --network testnet status
-./proof-hunters --network testnet mine --keystore ./testnet-wallet.json --max-fee-wei 100000000000000 --max-attempts 1000000
+python3 proof-hunters --network mainnet profile
+python3 proof-hunters --network mainnet status
 ```
 
-This example ceiling is 0.0001 ETH per transaction, not a recommended amount.
-The miner estimates gas and refuses a submission if the padded exposure exceeds
-the ceiling. Network gas is paid even if a transaction reverts. This is not a
-protocol reward setting, mining difficulty control, or total session budget.
-Each launcher call submits at most one proof. Set an explicit total spending
-budget before repeating calls; the native CLI's `--loop` has no total-run cap.
+These commands do not spend funds. On macOS/Linux, run `chmod 755 bproof` if your
+ZIP extractor did not preserve the executable bit. On Windows use `bproof.exe`
+where the native examples below use `bproof`. A source profile is intentionally
+disabled; the release package pins its matching binary checksum.
 
-An accepted proof creates an NFT; it does not pay liquid HUNTER tokens. Verify
-the reported transaction and NFT ownership. A search that finds no proof is not
-a failed transfer. Keep any pending transaction journal intact for recovery.
+## Build and inspect
 
-## Mainnet later
+If you prefer building from source, clone this repository and use its pinned Rust toolchain. The native examples below use the source-build path; bundle users substitute `./bproof` (or `bproof.exe` on Windows):
 
-Use a separately approved mainnet release/profile and wallet. Select
-`--network mainnet` and explicitly add `--confirm-mainnet` for mining. Never
-replace testnet addresses manually or assume testnet ETH works on mainnet.
+```sh
+cargo build --release --locked --bin bproof
+./target/release/bproof --help
+```
+
+Set the verified public configuration:
+
+```sh
+export RPC_URL=https://rpc.mainnet.chain.robinhood.com
+export CHAIN_ID=4663
+export MINING_CORE=0xf213854c6d5d4334d23d452574556bd53ca24c2c
+export BASKET=0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC
+./target/release/bproof status --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --json
+```
+
+Status is read-only and needs no wallet. Compare these settings with the [mainnet manifest](https://app.proofhunter.fun/release.json).
+
+## Create and fund a dedicated wallet
+
+```sh
+./target/release/bproof wallet new --keystore ./mainnet-miner.json --recovery-out ./mainnet-recovery.txt
+./target/release/bproof wallet address --keystore ./mainnet-miner.json --json
+```
+
+Choose the passphrase locally. Keep the recovery file private and offline. Send a deliberately limited amount of **mainnet ETH** from MetaMask to the printed mining address. The CLI signs with this wallet, and accepted proofs mint NFTs to it. HUNTER, USDG and NVDA are not gas, and holding them is not required to start base mining.
+
+## Authorise one bounded search
+
+This is a transaction-capable command. Choose a per-transaction fee ceiling before running it:
+
+```sh
+export MAX_TOTAL_FEE_WEI=100000000000000
+./target/release/bproof mine --submit --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --basket "$BASKET" --keystore ./mainnet-miner.json --max-fee "$MAX_TOTAL_FEE_WEI" --max-attempts 1000000 --threads 2 --json
+```
+
+The example ceiling is 0.0001 ETH, not a recommended budget. `--max-fee` caps total gas exposure for **one transaction**, not gas price or cumulative session spending. The release launcher calls this option `--max-fee-wei`. A search may finish without finding a proof.
+
+The native `--loop` option has no total-run spending cap. Do not treat the per-transaction limit as a run-wide budget. Preserve pending journals after crashes or uncertain RPC replies so the CLI can reconcile the exact signed transaction.
+
+## Mining Power and agents
+
+The current native CLI searches at base power. HUNTER locked and assigned in the app is distinct from a loose balance, and this CLI does not yet widen its search target for the boost. The browser provides the integrated Mining Power flow.
+
+An agent needs an explicitly selected network, a bounded run count and a spending limit. Never paste a private key, passphrase or recovery phrase into chat. The agent skill is operating guidance, not an isolation boundary or evidence of a released binary.
+
+## Use the packaged launcher for a bounded submission
+
+After creating and funding your dedicated wallet, explicitly authorize a mainnet
+submission and set your own fee ceiling:
+
+```sh
+python3 proof-hunters --network mainnet mine --confirm-mainnet --keystore ./mainnet-miner.json --max-fee-wei 100000000000000 --max-attempts 1000000 --threads 2
+```
+
+This performs at most one proof submission. The fee is an example, not a recommended
+spend. It never silently switches networks. A failed proof search can return no NFT.

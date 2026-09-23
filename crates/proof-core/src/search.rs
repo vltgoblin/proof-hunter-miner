@@ -1,8 +1,8 @@
 //! Deterministic, synchronous nonce search over wallet-bound proofs.
 
 use crate::{
-    Address, ChallengeInputs, Digest, ProofInputs, Target, Uint256, derive_challenge, meets_target,
-    proof_digest,
+    Address, ChallengeInputs, Digest, PreparedProof, ProofInputs, Target, Uint256,
+    derive_challenge, meets_target,
 };
 
 /// The result of one bounded nonce search.
@@ -32,17 +32,18 @@ pub fn search_nonce(
     attempt_budget: u64,
 ) -> SearchResult {
     let challenge = derive_challenge(&challenge_inputs);
+    let prepared = PreparedProof::new(&ProofInputs {
+        chain_id: challenge_inputs.chain_id,
+        mining_core: challenge_inputs.mining_core,
+        challenge_id: challenge_inputs.challenge_id,
+        challenge,
+        miner,
+        nonce: start_nonce,
+    });
     let mut nonce = start_nonce;
 
     for attempt in 0..attempt_budget {
-        let digest = proof_digest(&ProofInputs {
-            chain_id: challenge_inputs.chain_id,
-            mining_core: challenge_inputs.mining_core,
-            challenge_id: challenge_inputs.challenge_id,
-            challenge,
-            miner,
-            nonce,
-        });
+        let digest = prepared.digest(nonce);
 
         if meets_target(digest, target) {
             return SearchResult::Found {
@@ -65,6 +66,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::proof_digest;
 
     #[test]
     fn engine_finds_the_first_known_nonce_with_an_exact_attempt_count() {

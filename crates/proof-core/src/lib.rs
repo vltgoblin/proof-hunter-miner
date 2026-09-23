@@ -14,7 +14,7 @@ pub mod search;
 
 pub use proof::{
     Address, CHALLENGE_TYPE_STRING, CHALLENGE_TYPEHASH, ChallengeInputs, Digest, PREIMAGE_BYTES,
-    PROOF_TYPE_STRING, PROOF_TYPEHASH, PROOF_VERSION, ProofInputs, Target, Uint256,
+    PROOF_TYPE_STRING, PROOF_TYPEHASH, PROOF_VERSION, PreparedProof, ProofInputs, Target, Uint256,
     challenge_preimage, check_proof, derive_challenge, keccak256, meets_target, proof_digest,
     proof_preimage,
 };

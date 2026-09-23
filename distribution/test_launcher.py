@@ -44,4 +44,14 @@ class LauncherTests(unittest.TestCase):
  def test_status_no_wallet(self):
   self.save();self.args.command='status';self.args.keystore=None
   self.assertNotIn('--keystore',m.prepare(self.args,self.rpc))
+ def test_mainnet_rejects_testnet_chain_before_rpc(self):
+  self.args.network='mainnet';self.args.confirm_mainnet=True;self.profile['network']='mainnet';self.save()
+  with self.assertRaisesRegex(ValueError,'Mainnet profile must use chain 4663'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
+ def test_mainnet_status_uses_live_chain_without_wallet(self):
+  self.args.network='mainnet';self.args.command='status';self.args.keystore=None;self.profile.update(network='mainnet',chainId=4663);self.save()
+  command=m.prepare(self.args,lambda u,k,p:hex(4663) if k=='eth_chainId' else '0x6000')
+  self.assertEqual(command[command.index('--chain-id')+1],'4663');self.assertNotIn('--keystore',command)
+ def test_missing_binary_checksum_rejected(self):
+  self.profile['binarySha256']='';self.save()
+  with self.assertRaisesRegex(ValueError,'Missing release checksum'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
 if __name__=='__main__':unittest.main()

@@ -1,8 +1,10 @@
 # Verify a miner release
 
-**RC2 status:** v0.1.0 is a legacy token-mining release, not an accepted NFT-only RC2 binary. Verify the release model and approved network profile before use.
+**Mainnet:** chain 4663. Use v0.2.0 for NFT mining; v0.1.0 is legacy.
+Download from the exact release tag and verify the files below before execution.
+If that release is not published yet, use a reviewed source build instead.
 
-The binary release workflow produces five `bproof` binaries and a `SHA256SUMS` file:
+The binary release workflow produces five `bproof` binaries, five matching `proof-hunters-<system>.zip` launcher bundles and a `SHA256SUMS` file:
 
 | System | Release file |
 |---|---|
@@ -23,6 +25,10 @@ gh release download vX.Y.Z \
   --pattern bproof-macos-aarch64 \
   --pattern SHA256SUMS
 ```
+
+The same checks apply to each ZIP bundle: substitute its exact filename in the
+commands below. Bundles contain a profile with the SHA-256 of their own binary;
+profiles from different platforms are not interchangeable.
 
 ## Verify the build provenance
 

@@ -1,12 +1,15 @@
 {
   "network": "mainnet",
   "ready": false,
-  "reason": "Mainnet deployment not approved or configured",
-  "chainId": null,
-  "rpcUrl": null,
-  "miningCore": null,
-  "basket": null,
-  "coreCodeSha256": null,
-  "basketCodeSha256": null,
-  "binarySha256": null
+  "reason": "Mainnet protocol is live. This launcher package remains disabled until a matching NFT-miner binary and its release checksum are published.",
+  "chainId": 4663,
+  "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
+  "miningCore": "0xf213854c6d5d4334d23d452574556bd53ca24c2c",
+  "basket": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+  "coreCodeSha256": "ea920d1f4e301367d55db97512e723c441b2ccd63687109c6a9d1c01e355c169",
+  "basketCodeSha256": "399ec4bc5b43db03486ceae11f9a6fc5c126427f8f8e10c90fed0c773f4325c6",
+  "binarySha256": null,
+  "deploymentStatus": "live",
+  "releaseManifestUrl": "https://app.proofhunter.fun/release.json",
+  "deploymentSourceCommit": "2dff62d2f63f65d3cad99f28552e3fc546165220"
 }

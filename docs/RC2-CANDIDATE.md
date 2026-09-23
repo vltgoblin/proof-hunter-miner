@@ -1,4 +1,6 @@
-# RC2 candidate verification
+# Historical RC2 candidate verification
+
+This records the September 22 testnet candidate. For the current mainnet CLI, see [setup](getting-started.md) and [release verification](verifying-a-release.md).
 
 2026-09-22: full isolated `cargo test --workspace --locked -- --test-threads=1`
 passed all 104 tests with zero skip messages. Pinned Foundry 1.7.1 deployed the
