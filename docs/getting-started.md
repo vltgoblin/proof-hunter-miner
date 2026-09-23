@@ -3,13 +3,13 @@
 ## Choose the available mining path
 
 The [browser miner](https://app.proofhunter.fun/app/mine) and mainnet protocol are live.
-Use the **v0.2.1** CLI release or current reviewed source. **v0.1.0 is legacy** and
+Use the **v0.2.2** CLI release or current reviewed source. **v0.1.0 is legacy** and
 must not be used for NFT mining.
 
 ## Download a release bundle
 
 Get `proof-hunters-<system>.zip` and `SHA256SUMS` from
-[the v0.2.1 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.1).
+[the v0.2.2 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.2).
 Choose `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` or
 `windows-x86_64`. Follow [release verification](verifying-a-release.md) before
 extracting or running it. Python 3.9+ is required for the launcher.
@@ -22,8 +22,9 @@ python3 proof-hunters --network mainnet status
 ```
 
 These commands do not spend funds. On macOS/Linux, run `chmod 755 bproof` if your
-ZIP extractor did not preserve the executable bit. On Windows use `bproof.exe`
-where the native examples below use `bproof`. A source profile is intentionally
+ZIP extractor did not preserve the executable bit. Windows mining requires WSL2 with the Linux package; store the wallet in the Linux
+home directory. Native `bproof.exe` supports read-only commands and cannot create
+or unlock mining wallets. A source profile is intentionally
 disabled; the release package pins its matching binary checksum.
 
 ## Build and inspect
@@ -71,7 +72,7 @@ The native `--loop` option has no total-run spending cap. Do not treat the per-t
 
 ## Mining Power and agents
 
-The current native CLI searches at base power. HUNTER locked and assigned in the app is distinct from a loose balance, and this CLI does not yet widen its search target for the boost. The browser provides the integrated Mining Power flow.
+The CLI automatically uses Mining Power assigned to its mining wallet. Lock and assign HUNTER through the app to the exact address printed by `bproof wallet address`. New assignments apply from the next challenge; loose balances do not count. No assignment means 1x. Continuous `searchStarted` events report `baseTarget`, effective `target`, and `powerMultiplierWad` (1e18 = 1x). The CLI does not sign token approvals, deposits or assignments.
 
 An agent needs an explicitly selected network, a bounded run count and a spending limit. Never paste a private key, passphrase or recovery phrase into chat. The agent skill is operating guidance, not an isolation boundary or evidence of a released binary.
 

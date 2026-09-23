@@ -162,11 +162,7 @@ fn live_anvil_mines_and_submits_one_real_proof() {
             "from": accounts[0], "to": miner, "value": "0xde0b6b3a7640000"
         }]),
     );
-    let funding_receipt = rpc(
-        &endpoint,
-        "eth_getTransactionReceipt",
-        json!([funding_hash]),
-    );
+    let funding_receipt = wait_local_receipt(&endpoint, funding_hash);
     assert_eq!(funding_receipt["status"], "0x1");
     assert_eq!(
         rpc(&endpoint, "eth_getBalance", json!([miner, "latest"])),
@@ -447,6 +443,328 @@ fn lost_send_reply_recovers_exact_signed_transaction_before_new_mining() {
     assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 1);
     assert!(!pending.exists());
     drop(proxy);
+}
+
+#[test]
+fn live_anvil_assigned_power_mines_bonus_nonce_only_from_next_challenge() {
+    let contracts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../contracts");
+    if !contracts.exists() {
+        report_live_skip("monorepo contracts unavailable for Mining Power acceptance");
+        return;
+    }
+    disable_core_dumps_for_children();
+    let port = unused_local_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let directory = temp_directory(port);
+    let mut anvil = AnvilGuard::start(port, directory.clone());
+    wait_for_anvil(&endpoint, &mut anvil.child);
+    deploy_launch_set(&endpoint, &directory);
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
+    let keystore = directory.join("power-wallet.json");
+    let recovery = directory.join("power-recovery.txt");
+    let passfile = directory.join("power-passphrase");
+    let passphrase = runtime_secret();
+    write_owner_only(&passfile, passphrase.as_bytes());
+    let created = run([
+        "wallet",
+        "new",
+        "--keystore",
+        keystore.to_str().unwrap(),
+        "--recovery-out",
+        recovery.to_str().unwrap(),
+        "--passphrase-file",
+        passfile.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(created.status.code(), Some(0));
+    let wallet: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let miner = wallet["address"].as_str().unwrap();
+    let accounts = rpc(&endpoint, "eth_accounts", json!([]));
+    let owner = accounts[0].as_str().unwrap();
+    rpc(
+        &endpoint,
+        "anvil_setBalance",
+        json!([miner, "0xde0b6b3a7640000"]),
+    );
+    let token = power_fixture_deploy(
+        &contracts,
+        &endpoint,
+        owner,
+        "script/LocalPhase1Composition.s.sol:Phase1FixtureToken",
+        &[],
+    );
+    let custody = power_fixture_deploy(
+        &contracts,
+        &endpoint,
+        owner,
+        "src/bloom/MiningPowerCustody.sol:MiningPowerCustody",
+        &[&token, MINING_CORE, "1000000000000000000000"],
+    );
+    let nft = mining_core_child_address(&endpoint, "PROOF_NFT()");
+    let lifecycle = power_child(&endpoint, &nft, "LIFECYCLE()");
+    let reserve = power_child(&endpoint, &lifecycle, "reserve()");
+    power_send(
+        &endpoint,
+        owner,
+        &reserve,
+        "activateToken(address)",
+        &[power_address_word(&token)],
+    );
+    power_send(
+        &endpoint,
+        owner,
+        MINING_CORE,
+        "attachMiningPowerLate(address)",
+        &[power_address_word(&custody)],
+    );
+    let amount = format!("{:064x}", 5_000_000_000_000_000_000_000_u128);
+    power_send(
+        &endpoint,
+        owner,
+        &token,
+        "mint(address,uint256)",
+        &[power_address_word(owner), amount.clone()],
+    );
+    power_send(
+        &endpoint,
+        owner,
+        &token,
+        "approve(address,uint256)",
+        &[power_address_word(&custody), amount.clone()],
+    );
+    power_send(
+        &endpoint,
+        owner,
+        &custody,
+        "deposit(uint256)",
+        std::slice::from_ref(&amount),
+    );
+    power_send(
+        &endpoint,
+        owner,
+        &custody,
+        "assign(address,uint256)",
+        &[power_address_word(miner), amount],
+    );
+    let read_power = |challenge: u64, wallet: &str| {
+        let data = format!(
+            "{}{:064x}{}",
+            selector("powerMultiplierWad(uint256,address)"),
+            challenge,
+            power_address_word(wallet)
+        );
+        word_to_u128(eth_call(&endpoint, &custody, data).as_str().unwrap())
+    };
+    assert_eq!(read_power(1, miner), 1_000_000_000_000_000_000);
+    // A digest above the base target must still be refused while the newly
+    // assigned tokens are pending for the already-open challenge.
+    let (nonce, _) = power_bonus_nonce(&endpoint, miner);
+    let pending = power_search(&endpoint, miner, nonce);
+    assert_eq!(
+        pending.status.code(),
+        Some(1),
+        "pending stake must not widen challenge 1"
+    );
+    let first = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passfile,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    rpc(&endpoint, "anvil_mine", json!(["0x80"]));
+    assert_eq!(read_power(2, miner), 2_000_000_000_000_000_000);
+    assert_eq!(
+        read_power(2, accounts[1].as_str().unwrap()),
+        1_000_000_000_000_000_000
+    );
+    let (nonce, digest) = power_bonus_nonce(&endpoint, miner);
+    let found = power_search(&endpoint, miner, nonce);
+    assert_eq!(
+        found.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let found: Value = serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(found["digest"], digest);
+    assert_eq!(found["proofClassification"], "proofHunter");
+    let submitted = run([
+        "submit",
+        "--rpc-url",
+        &endpoint,
+        "--chain-id",
+        CHAIN_ID,
+        "--mining-core",
+        MINING_CORE,
+        "--basket",
+        common::BASKET,
+        "--mining-nonce",
+        &nonce.to_string(),
+        "--keystore",
+        keystore.to_str().unwrap(),
+        "--passphrase-file",
+        passfile.to_str().unwrap(),
+        "--max-fee",
+        "1000000000000000000",
+        "--json",
+    ]);
+    assert_eq!(
+        submitted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let submitted: Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    assert_eq!(submitted["status"], "mined");
+    assert_eq!(submitted["proofClassification"], "proofHunter");
+    assert_eq!(token_balance(&endpoint, &nft, miner), 2);
+    let id = submitted["nftTokenId"]
+        .as_str()
+        .unwrap()
+        .parse::<u128>()
+        .unwrap();
+    let owner_word = eth_call(
+        &endpoint,
+        &nft,
+        format!("{}{:064x}", selector("ownerOf(uint256)"), id),
+    );
+    assert_eq!(
+        &owner_word.as_str().unwrap()[26..],
+        miner.trim_start_matches("0x")
+    );
+    println!(
+        "Mining Power local acceptance: pending=1x; next challenge=2x; bonus digest submitted; NFT ownership verified"
+    );
+}
+
+fn power_address_word(address: &str) -> String {
+    format!("{:0>64}", address.trim_start_matches("0x"))
+}
+fn power_child(endpoint: &str, to: &str, signature: &str) -> String {
+    let result = eth_call(endpoint, to, selector(signature));
+    format!("0x{}", &result.as_str().unwrap()[26..])
+}
+fn power_send(endpoint: &str, from: &str, to: &str, signature: &str, words: &[String]) {
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let hash = rpc(
+        endpoint,
+        "eth_sendTransaction",
+        json!([{"from":from,"to":to,"data":format!("{}{}", selector(signature), words.join("")),"gas":"0x500000"}]),
+    );
+    let receipt = wait_local_receipt(endpoint, hash);
+    assert_eq!(
+        receipt["status"], "0x1",
+        "{signature} receipt missing or reverted"
+    );
+}
+fn wait_local_receipt(endpoint: &str, hash: Value) -> Value {
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    for _ in 0..100 {
+        let receipt = rpc(endpoint, "eth_getTransactionReceipt", json!([hash]));
+        if !receipt.is_null() {
+            return receipt;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("local transaction receipt did not arrive");
+}
+fn power_fixture_deploy(
+    contracts: &Path,
+    endpoint: &str,
+    from: &str,
+    artifact: &str,
+    args: &[&str],
+) -> String {
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let mut command = Command::new("forge");
+    command
+        .current_dir(contracts)
+        .env("FOUNDRY_PROFILE", "release")
+        .args([
+            "create",
+            artifact,
+            "--rpc-url",
+            endpoint,
+            "--from",
+            from,
+            "--unlocked",
+            "--broadcast",
+            "--json",
+        ]);
+    if !args.is_empty() {
+        command.arg("--constructor-args").args(args);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<Value>(&output.stdout).unwrap()["deployedTo"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+fn power_search(endpoint: &str, miner: &str, nonce: u64) -> Output {
+    run([
+        "mine",
+        "--rpc-url",
+        endpoint,
+        "--chain-id",
+        CHAIN_ID,
+        "--mining-core",
+        MINING_CORE,
+        "--miner",
+        miner,
+        "--start-nonce",
+        &nonce.to_string(),
+        "--max-attempts",
+        "1",
+        "--threads",
+        "1",
+        "--json",
+    ])
+}
+fn power_bonus_nonce(endpoint: &str, miner: &str) -> (u64, String) {
+    // Independent contract digest oracle; choose a proof in the additional 2x
+    // window, above base but below the contract cap. No easy-target override.
+    let base = eth_call(endpoint, MINING_CORE, selector("currentTarget()"));
+    let maximum = eth_call(endpoint, MINING_CORE, selector("MAX_TARGET()"));
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(&base.as_str().unwrap()[2 + i * 2..4 + i * 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    let base_word = proof_core::Uint256::from_be_bytes(bytes.try_into().unwrap());
+    let doubled = hex(&base_word.wrapping_add(base_word).to_be_bytes());
+    let effective = doubled.as_str().min(maximum.as_str().unwrap());
+    let challenge = eth_call(endpoint, MINING_CORE, selector("currentChallenge()"));
+    let id = mining_core_word(endpoint, "activeChallengeId()");
+    for nonce in 0_u64..10_000 {
+        let digest = eth_call(
+            endpoint,
+            MINING_CORE,
+            format!(
+                "{}{:064x}{}{}{:064x}",
+                selector("deriveProofDigest(uint256,bytes32,address,uint256)"),
+                id,
+                challenge.as_str().unwrap().trim_start_matches("0x"),
+                power_address_word(miner),
+                nonce
+            ),
+        );
+        let digest = digest.as_str().unwrap();
+        if digest > base.as_str().unwrap() && digest <= effective {
+            return (nonce, digest.to_owned());
+        }
+    }
+    panic!("no bonus-window proof found in bounded fixture search");
 }
 
 fn mine_submit_args(

@@ -332,7 +332,7 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
             ChallengeStatus::Active => {}
         }
 
-        let classified_state = match reader.read_classified_state() {
+        let classified_state = match reader.read_classified_state(Some(request.miner)) {
             Ok(state) => {
                 backoff.reset();
                 state
@@ -364,13 +364,19 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
             json!({
                 "challengeId": uint256_to_decimal(state.challenge_inputs.challenge_id),
                 "challenge": hex_string(&state.challenge.to_bytes()),
-                "target": hex_string(&state.target.to_be_bytes()),
+                "target": hex_string(&classified_state.effective_target.to_be_bytes()),
+                "baseTarget": hex_string(&state.target.to_be_bytes()),
+                "powerMultiplierWad": uint256_to_decimal(classified_state.power_multiplier_wad),
                 "threads": request.threads.to_string(),
             }),
         )?;
 
-        let watched = match watched_mine(&request, &state.challenge_inputs, state.target, &shutdown)
-        {
+        let watched = match watched_mine(
+            &request,
+            &state.challenge_inputs,
+            classified_state.effective_target,
+            &shutdown,
+        ) {
             Ok(watched) => watched,
             Err(error) => {
                 if repeated_failure(&writer, &book, &shutdown, &mut backoff, error)? {

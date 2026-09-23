@@ -7,6 +7,7 @@ mod continuous;
 mod mining;
 mod output;
 mod parse;
+mod power;
 mod submit;
 
 use std::process::ExitCode;

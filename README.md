@@ -47,8 +47,12 @@ receipt before allowing a new transaction. Corrupt, overly permissive, or
 inconsistent journal state fails closed. Never delete a pending journal merely
 to bypass this guard; reconcile its transaction first.
 
-The search uses the core's base target. It does not yet search Mining Power's boosted
-effective target for HUNTER assigned to a mining wallet. `schedule` and `--state-file` remain legacy offline
+Live mining and submission automatically use the core-selected Mining Power module's
+challenge-bound multiplier for the mining wallet. Lock and assign HUNTER to that
+exact address through the app; new assignments apply from the next challenge.
+Loose token balances do not boost mining. No assigned power means 1x.
+Continuous search events report the base target, effective target and multiplier.
+A failed power read pauses live search rather than silently guessing a multiplier. `schedule` and `--state-file` remain legacy offline
 calculation tools; their token schedule is not the current live settlement model.
 
 See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
@@ -57,7 +61,7 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
 The mainnet protocol is live and its public addresses/runtime hashes are recorded
-in the mainnet profile. Source profile templates stay disabled. The v0.2.1 release bundles contain a
+in the mainnet profile. Source profile templates stay disabled. The v0.2.2 release bundles will contain a
 matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
 Mainnet mining through a released launcher requires explicit confirmation.
 
@@ -72,10 +76,10 @@ agent's skill directory. It uses bounded mining calls and an explicit gas ceilin
 
 ## Release status
 
-**Mainnet: live on Robinhood Chain (4663).** Download the current **v0.2.1**
-package from [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.1)
-and verify its checksum and build attestation before use. The older **v0.1.0 is
-legacy** and must not be used for mainnet NFT mining. If v0.2.1 is not available,
+**Mainnet: live on Robinhood Chain (4663).** The **v0.2.2** download is being prepared.
+Build the current source now, or check [Releases](https://github.com/vltgoblin/proof-hunter-miner/releases).
+Verify download checksums and build attestations before use. The older **v0.1.0 is
+legacy** and must not be used for mainnet NFT mining. If v0.2.2 is not available,
 build the current source; never substitute a v0.1.0 binary.
 
 Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and

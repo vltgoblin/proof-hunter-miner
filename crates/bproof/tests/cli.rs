@@ -458,7 +458,7 @@ fn top_level_help_documents_all_exit_codes() {
 
 #[test]
 fn live_status_and_mine_are_always_labelled_chain_while_file_stays_file() {
-    let (status_endpoint, status_server) = spawn_recorded_rpc_server();
+    let (status_endpoint, status_server) = spawn_recorded_rpc_server(false);
     let live_status = run([
         "status",
         "--rpc-url",
@@ -494,7 +494,7 @@ fn live_status_and_mine_are_always_labelled_chain_while_file_stays_file() {
         file_status_value["stateSource"]
     );
 
-    let (mine_endpoint, mine_server) = spawn_recorded_rpc_server();
+    let (mine_endpoint, mine_server) = spawn_recorded_rpc_server(true);
     let live_mine = run([
         "mine",
         "--rpc-url",
@@ -763,13 +763,27 @@ fn assert_exact_keys<const N: usize>(value: &Value, expected: [&str; N]) {
     assert_eq!(actual, expected);
 }
 
-fn spawn_recorded_rpc_server() -> (String, JoinHandle<()>) {
-    let exchanges = serde_json::from_str::<RecordedFixture>(RPC_FIXTURE)
+fn spawn_recorded_rpc_server(with_power: bool) -> (String, JoinHandle<()>) {
+    let mut exchanges = serde_json::from_str::<RecordedFixture>(RPC_FIXTURE)
         .expect("recorded RPC fixture must be valid")
         .exchanges
         .into_iter()
         .filter(|exchange| exchange.request["method"] != "eth_getBlockByNumber")
         .collect::<Vec<_>>();
+    if with_power {
+        let selector = proof_core::keccak256(b"miningPower()").to_bytes();
+        let data = format!(
+            "0x{}",
+            selector[..4]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        exchanges.push(RecordedExchange {
+            request: json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x5fbdb2315678afecb367f032d93f642f64180aa3","data":data},"0x3ec"]}),
+            response: json!({"jsonrpc":"2.0","id":1,"result":format!("0x{}", "0".repeat(64))}),
+        });
+    }
     let listener = TcpListener::bind("127.0.0.1:0").expect("fixture server must bind");
     let endpoint = format!(
         "http://{}",

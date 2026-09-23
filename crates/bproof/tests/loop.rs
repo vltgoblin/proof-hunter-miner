@@ -285,7 +285,9 @@ fn live_anvil_loop_accepts_two_proofs_then_stops_cleanly() {
     while Instant::now() < deadline {
         let line = lines_rx
             .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|error| panic!("loop produced no event: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("loop produced no event: {error}; prior events: {events:?}")
+            });
         let event: Value = serde_json::from_str(&line)
             .unwrap_or_else(|error| panic!("loop line is not JSON: {error}: {line}"));
         if event["event"] == "started" {
