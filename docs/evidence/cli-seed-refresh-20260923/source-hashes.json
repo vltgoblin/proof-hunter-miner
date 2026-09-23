@@ -1,0 +1,20 @@
+{
+  "crates/bproof/src/chain.rs": "6882cfecb041809fe43e2cc94f682fb2d45a21f41eeffb574000ea0d1ae78cb5",
+  "crates/bproof/src/classification.rs": "185a30d5513fce29b979003b80e9f3acada564cb88bc410f3e944833ba8bb0b3",
+  "crates/bproof/src/cli.rs": "a054af09dd29b8847f8423b42b6a6a01a86eda0a298dcd90c79f69b8386ea38e",
+  "crates/bproof/src/continuous.rs": "49e86fc7e5da48000d69b1a3b474e1f4f77b70ddde18319e5ab0a1d1b20b65ea",
+  "crates/bproof/src/keystore.rs": "7074f1c53efdc255118a28675574eb8f112f98276658e89814727b17927f4549",
+  "crates/bproof/src/lib.rs": "ece8452fcb239a3d56f709e5fd9f12709ffaeb852930565bed28f32d35f41ce5",
+  "crates/bproof/src/main.rs": "ec10dfaac9f95efde22282f4ded7fa7f9667ac1bca7f3e634f64f3d3af852d40",
+  "crates/bproof/src/mining.rs": "b2e05b903f59337f02eaf7fd890e76500d954ffb660a071073b63624c1cf4e03",
+  "crates/bproof/src/output.rs": "4db6ba90afec0697c3ccae55b191f9789224dfba4a20632b701b9b9e1bf7c1cb",
+  "crates/bproof/src/parse.rs": "f98d7a670963ab3f1143c00ec159d7ed37fd4e5b7bf39043c22e81bba4b60007",
+  "crates/bproof/src/submit.rs": "e8e4626e82e2e7a6b4a81b9ee4289c3fb3147ac194bfe41305575b843897062e",
+  "crates/bproof/src/transaction.rs": "67061263eff9fe7919733c85da3a27032c0c6005226e6a478b12f09fdd2f9148",
+  "crates/bproof/src/power.rs": "9408b0811be1dc83fb738866689e8835db031ecb4f46b52624b6d8f7a5a85a15",
+  "crates/bproof/tests/cli.rs": "9089b303a5460ea616fd43cfb369eb34376cfc735e1022741d924ace4d353eb4",
+  "crates/bproof/tests/loop.rs": "030093023a12c9ddfb36e8f5a38a650017f3bcb0b8c19f0361e80c3694190d57",
+  "crates/bproof/tests/submit.rs": "562efda50ec99d71db76482ebf82e0d3ff9fc8e9e35e508fda6a61b2aec612dc",
+  "crates/bproof/tests/wallet.rs": "59298b979cb84e0f8433db62426208fed6bad60829b53abe4720ed3b46f09d4f",
+  "crates/bproof/tests/common/mod.rs": "581fca4fa2cff962b8d56aed82d757327e178fe485f2746dff32e0576b857f0e"
+}

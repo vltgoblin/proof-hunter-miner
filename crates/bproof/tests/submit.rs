@@ -418,6 +418,21 @@ fn lost_send_reply_recovers_exact_signed_transaction_before_new_mining() {
     );
     let pending = keystore.with_file_name("recovery-wallet.json.pending-submission.json");
     assert!(pending.exists());
+    // A lost reply can happen before automining completes. Wait for this exact
+    // journaled hash, not a guessed nonce, before asserting chain inclusion.
+    let journal: Value = serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+    for _ in 0..100 {
+        let receipt = rpc(
+            &endpoint,
+            "eth_getTransactionReceipt",
+            json!([journal["transactionHash"]]),
+        );
+        if !receipt.is_null() {
+            assert_eq!(receipt["status"], "0x1");
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(account_transaction_count(&endpoint, miner), 1);
 
     let recovered = run(mine_submit_args(
@@ -442,6 +457,245 @@ fn lost_send_reply_recovers_exact_signed_transaction_before_new_mining() {
     assert_eq!(account_transaction_count(&endpoint, miner), 1);
     assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 1);
     assert!(!pending.exists());
+    drop(proxy);
+}
+
+#[test]
+fn expired_seed_refresh_obeys_fee_limit_and_recovers_lost_reply_without_minting() {
+    if !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../contracts")
+        .exists()
+    {
+        report_live_skip("the monorepo contracts tree is unavailable in this checkout");
+        return;
+    }
+    if Command::new("anvil").arg("--version").output().is_err() {
+        report_live_skip("`anvil` is unavailable");
+        return;
+    }
+
+    disable_core_dumps_for_children();
+    let port = unused_local_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let directory = temp_directory(port);
+    let mut anvil = AnvilGuard::start(port, directory.clone());
+    wait_for_anvil(&endpoint, &mut anvil.child);
+    rpc(
+        &endpoint,
+        "anvil_setCode",
+        json!(["0x00000000000000000000000000000000000ba5e7", "0x00"]),
+    );
+    deploy_launch_set(&endpoint, &directory);
+    rpc(&endpoint, "anvil_mine", json!(["0x200"]));
+
+    let keystore = directory.join("recovery-wallet.json");
+    let recovery_file = directory.join("recovery-wallet-phrase.txt");
+    let passphrase_file = directory.join("recovery-passphrase");
+    let passphrase = runtime_secret();
+    write_owner_only(&passphrase_file, passphrase.as_bytes());
+    let created = run([
+        "wallet",
+        "new",
+        "--keystore",
+        keystore.to_str().unwrap(),
+        "--recovery-out",
+        recovery_file.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase_file.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(created.status.code(), Some(0));
+    let wallet: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let miner = wallet["address"].as_str().unwrap();
+    rpc(
+        &endpoint,
+        "anvil_setBalance",
+        json!([miner, "0xde0b6b3a7640000"]),
+    );
+
+    assert_eq!(mining_core_word(&endpoint, "challengeState()"), 2);
+    let refused = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passphrase_file,
+        "1",
+        CHAIN_ID,
+        None,
+    ));
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(account_transaction_count(&endpoint, miner), 0);
+    assert!(
+        !keystore
+            .with_file_name("recovery-wallet.json.pending-submission.json")
+            .exists()
+    );
+    let proxy = LostSendReplyProxy::start(endpoint.clone());
+    let first = run(mine_submit_args(
+        &proxy.endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&first, passphrase.as_bytes());
+    assert_eq!(first.status.code(), Some(2));
+    let first_error = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_error.contains("durable recovery journal retained"),
+        "{first_error}"
+    );
+    let pending = keystore.with_file_name("recovery-wallet.json.pending-submission.json");
+    assert!(pending.exists());
+    // A lost reply can happen before automining completes. Wait for this exact
+    // journaled hash, not a guessed nonce, before asserting chain inclusion.
+    let journal: Value = serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+    for _ in 0..100 {
+        let receipt = rpc(
+            &endpoint,
+            "eth_getTransactionReceipt",
+            json!([journal["transactionHash"]]),
+        );
+        if !receipt.is_null() {
+            assert_eq!(receipt["status"], "0x1");
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(account_transaction_count(&endpoint, miner), 1);
+
+    let recovered = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&recovered, passphrase.as_bytes());
+    assert_eq!(
+        recovered.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["accountNonce"], "0");
+    assert!(recovered["nftTokenId"].is_null());
+    assert_eq!(recovered["status"], "seedRefreshed");
+    assert_eq!(recovered["proofClassification"], "seedRefresh");
+    assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 2);
+    assert_eq!(account_transaction_count(&endpoint, miner), 1);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 0);
+    assert_eq!(mining_core_word(&endpoint, "acceptedProofs()"), 0);
+    assert!(!pending.exists());
+    drop(proxy);
+}
+
+#[test]
+fn another_miner_refreshing_before_signing_prevents_our_refresh_send() {
+    if !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../contracts")
+        .exists()
+    {
+        report_live_skip("the monorepo contracts tree is unavailable in this checkout");
+        return;
+    }
+    if Command::new("anvil").arg("--version").output().is_err() {
+        report_live_skip("`anvil` is unavailable");
+        return;
+    }
+
+    disable_core_dumps_for_children();
+    let port = unused_local_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let directory = temp_directory(port);
+    let mut anvil = AnvilGuard::start(port, directory.clone());
+    wait_for_anvil(&endpoint, &mut anvil.child);
+    rpc(
+        &endpoint,
+        "anvil_setCode",
+        json!(["0x00000000000000000000000000000000000ba5e7", "0x00"]),
+    );
+    deploy_launch_set(&endpoint, &directory);
+    rpc(&endpoint, "anvil_mine", json!(["0x200"]));
+
+    let keystore = directory.join("recovery-wallet.json");
+    let recovery_file = directory.join("recovery-wallet-phrase.txt");
+    let passphrase_file = directory.join("recovery-passphrase");
+    let passphrase = runtime_secret();
+    write_owner_only(&passphrase_file, passphrase.as_bytes());
+    let created = run([
+        "wallet",
+        "new",
+        "--keystore",
+        keystore.to_str().unwrap(),
+        "--recovery-out",
+        recovery_file.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase_file.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(created.status.code(), Some(0));
+    let wallet: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let miner = wallet["address"].as_str().unwrap();
+    rpc(
+        &endpoint,
+        "anvil_setBalance",
+        json!([miner, "0xde0b6b3a7640000"]),
+    );
+
+    assert_eq!(mining_core_word(&endpoint, "challengeState()"), 2);
+    let refused = run(mine_submit_args(
+        &endpoint,
+        &keystore,
+        &passphrase_file,
+        "1",
+        CHAIN_ID,
+        None,
+    ));
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(account_transaction_count(&endpoint, miner), 0);
+    assert!(
+        !keystore
+            .with_file_name("recovery-wallet.json.pending-submission.json")
+            .exists()
+    );
+    let proxy = LostSendReplyProxy::with_refresh_race(endpoint.clone(), true);
+    let first = run(mine_submit_args(
+        &proxy.endpoint,
+        &keystore,
+        &passphrase_file,
+        "1000000000000000000",
+        CHAIN_ID,
+        None,
+    ));
+    assert_no_secret(&first, passphrase.as_bytes());
+    assert_eq!(first.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("expired seed changed"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(account_transaction_count(&endpoint, miner), 0);
+    assert_eq!(mining_core_word(&endpoint, "activeChallengeId()"), 2);
+    assert_eq!(mining_core_word(&endpoint, "nftsMintedEver()"), 0);
+    assert!(
+        !keystore
+            .with_file_name("recovery-wallet.json.pending-submission.json")
+            .exists()
+    );
     drop(proxy);
 }
 
@@ -1005,6 +1259,10 @@ struct LostSendReplyProxy {
 
 impl LostSendReplyProxy {
     fn start(upstream: String) -> Self {
+        Self::with_refresh_race(upstream, false)
+    }
+
+    fn with_refresh_race(upstream: String, refresh_race: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1033,7 +1291,33 @@ impl LostSendReplyProxy {
                     .send(body.as_slice())
                     .unwrap();
                 let response_body = response.body_mut().read_to_string().unwrap();
-                if is_send && !dropped.swap(true, Ordering::AcqRel) {
+                if refresh_race
+                    && request["method"] == "eth_estimateGas"
+                    && !dropped.swap(true, Ordering::AcqRel)
+                {
+                    let accounts = rpc(&upstream, "eth_accounts", json!([]));
+                    let data = format!(
+                        "0x{}",
+                        keccak256(b"refreshExpiredSeed()").to_bytes()[..4]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    );
+                    let hash = rpc(
+                        &upstream,
+                        "eth_sendTransaction",
+                        json!([{"from":accounts[0],"to":MINING_CORE,"data":data,"gas":"0x7a120"}]),
+                    );
+                    for _ in 0..100 {
+                        let receipt = rpc(&upstream, "eth_getTransactionReceipt", json!([hash]));
+                        if !receipt.is_null() {
+                            assert_eq!(receipt["status"], "0x1");
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                if !refresh_race && is_send && !dropped.swap(true, Ordering::AcqRel) {
                     drop(stream);
                     continue;
                 }

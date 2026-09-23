@@ -62,7 +62,7 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
 The mainnet protocol is live and its public addresses/runtime hashes are recorded
-in the mainnet profile. Source profile templates stay disabled. The v0.2.2 release bundles contain a
+in the mainnet profile. Source profile templates stay disabled. The v0.2.3 release bundles contain a
 matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
 Mainnet mining through a released launcher requires explicit confirmation.
 
@@ -77,17 +77,13 @@ agent's skill directory. It uses bounded mining calls and an explicit gas ceilin
 
 ## Release status
 
-**Mainnet: live on Robinhood Chain (4663).** [Download v0.2.2](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.2), including assigned HUNTER mining power.
+**Mainnet: live on Robinhood Chain (4663).** [Download v0.2.3](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.3), including assigned HUNTER mining power.
 Verify download checksums and build attestations before use. The older **v0.1.0 is
 legacy** and must not be used for mainnet NFT mining.
 
 Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and
 mainnet configuration. The raw `bproof-*` files are also available for users who
 supply the explicit network options themselves. Read [the setup guide](docs/getting-started.md).
-
-**Expired challenge seeds:** continuous mining waits for an external seed refresh;
-this CLI does not send that refresh transaction. Read-only `status` may report
-`challenge unavailable` until the seed is refreshed.
 
 The approximately month-long collection model is a population scenario, not a
 promise about one miner or the completion date.
@@ -111,3 +107,19 @@ with browser proofs. Stronger hardware can search more nonces; equal rules do no
 promise equal wins per device. The browser remains a valid mining path.
 
 [An early signal](DISCOVER.md)
+
+## Automatic seed refresh
+
+Expired seeds are refreshed automatically when `mine --submit` is authorized.
+A one-shot run sends only the refresh, reports `seedRefreshed`, and exits; invoke
+it again after the seed becomes readable to mine. With `--loop`, the miner waits
+for the new seed and resumes itself. Read-only commands never refresh or spend.
+The refresh uses the same per-transaction `--max-fee` ceiling, has zero ETH value,
+and mints no NFT. Another miner can win the refresh race; a reverted transaction
+can still cost gas. Refresh fees are included in the loop's total fees.
+
+An unresolved refresh is journaled before broadcast and reconciled on restart.
+If the seed changed and no receipt is available, recovery refuses to rebroadcast
+stale refresh bytes and keeps the journal for investigation. Never clear it to
+force another transaction. Version 2 journals support proof and refresh calls;
+existing version 1 proof journals remain readable.

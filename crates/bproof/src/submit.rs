@@ -58,6 +58,7 @@ pub struct FeeQuote {
 }
 
 pub struct PreparedSubmission {
+    seed_refresh: bool,
     pub mining_nonce: Uint256,
     pub account_nonce: Uint256,
     pub fee_quote: FeeQuote,
@@ -96,6 +97,7 @@ pub enum PreparationOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MinedSubmission {
+    pub seed_refresh: bool,
     pub transaction_hash: Digest,
     pub mining_nonce: Uint256,
     pub account_nonce: Uint256,
@@ -117,6 +119,8 @@ pub struct RecoveredSubmission {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingSubmissionDocument {
+    #[serde(default)]
+    seed_refresh: bool,
     version: u8,
     transaction_hash: String,
     raw_transaction: String,
@@ -144,7 +148,7 @@ struct PendingSubmissionDocument {
     classification_reason: Option<String>,
 }
 
-const PENDING_SUBMISSION_VERSION: u8 = 1;
+const PENDING_SUBMISSION_VERSION: u8 = 2;
 
 pub fn prepare_submission(
     reader: &RpcChainReader,
@@ -169,7 +173,67 @@ pub fn prepare_submission(
         mining_nonce,
         basket,
     );
-    let call = transaction_call(miner, challenge_inputs.mining_core, &call_data);
+    let mut outcome = prepare_call(
+        reader,
+        challenge_inputs.chain_id,
+        challenge_inputs.mining_core,
+        miner,
+        call_data,
+        fee_options,
+    )?;
+    if let PreparationOutcome::Ready(prepared) = &mut outcome {
+        prepared.mining_nonce = mining_nonce;
+        prepared.challenge_id = challenge_inputs.challenge_id;
+        prepared.seed_parent_block = challenge_inputs.seed_parent_block;
+        prepared.challenge = challenge;
+        prepared.expected_digest = expected_digest;
+        prepared.basket = basket;
+    }
+    Ok(outcome)
+}
+
+pub fn prepare_seed_refresh(
+    reader: &RpcChainReader,
+    chain_id: Uint256,
+    core: Address,
+    miner: Address,
+    expired: (Uint256, Uint256),
+    fee_options: FeeOptions,
+) -> Result<PreparationOutcome, String> {
+    if !reader.matches_deployment(chain_id, core) || reader.expired_seed()? != Some(expired) {
+        return Ok(PreparationOutcome::SimulationRejected {
+            reason: "expired seed changed before refresh preparation".to_owned(),
+        });
+    }
+    let mut outcome = prepare_call(
+        reader,
+        chain_id,
+        core,
+        miner,
+        refresh_call_data(),
+        fee_options,
+    )?;
+    if let PreparationOutcome::Ready(prepared) = &mut outcome {
+        prepared.seed_refresh = true;
+        prepared.challenge_id = expired.0;
+        prepared.seed_parent_block = expired.1;
+    }
+    Ok(outcome)
+}
+
+fn refresh_call_data() -> Vec<u8> {
+    keccak256(b"refreshExpiredSeed()").to_bytes()[..4].to_vec()
+}
+
+fn prepare_call(
+    reader: &RpcChainReader,
+    chain_id: Uint256,
+    core: Address,
+    miner: Address,
+    call_data: Vec<u8>,
+    fee_options: FeeOptions,
+) -> Result<PreparationOutcome, String> {
+    let call = transaction_call(miner, core, &call_data);
 
     if let Err(error) = reader.rpc_result(
         "proof simulation",
@@ -219,25 +283,26 @@ pub fn prepare_submission(
         "eth_getTransactionCount result for account nonce",
     )?;
     let transaction = Eip1559Transaction {
-        chain_id: challenge_inputs.chain_id,
+        chain_id,
         account_nonce,
         max_priority_fee_per_gas: Uint256::from(priority_fee_per_gas_wei),
         max_fee_per_gas: Uint256::from(fee_quote.max_fee_per_gas_wei),
         gas_limit: Uint256::from(fee_quote.gas_limit),
-        to: challenge_inputs.mining_core,
+        to: core,
         data: call_data,
     };
 
     Ok(PreparationOutcome::Ready(Box::new(PreparedSubmission {
-        mining_nonce,
+        seed_refresh: false,
+        mining_nonce: Uint256::ZERO,
         account_nonce,
         fee_quote,
         miner,
-        challenge_id: challenge_inputs.challenge_id,
-        seed_parent_block: challenge_inputs.seed_parent_block,
-        challenge,
-        expected_digest,
-        basket,
+        challenge_id: Uint256::ZERO,
+        seed_parent_block: Uint256::ZERO,
+        challenge: Digest::from_bytes([0; 32]),
+        expected_digest: Digest::from_bytes([0; 32]),
+        basket: Address::from_bytes([0; 20]),
         transaction,
     })))
 }
@@ -262,6 +327,12 @@ pub fn recover_pending_submission(
     }
     let document = read_pending_document(&journal_path)?;
     let (expected_hash, raw_transaction, prepared) = document.to_prepared()?;
+    if !reader.matches_deployment(prepared.transaction.chain_id, prepared.transaction.to) {
+        return Err(
+            "pending transaction belongs to a different deployment; journal retained".to_owned(),
+        );
+    }
+    reader.verify_identity()?;
     if keccak256(&raw_transaction) != expected_hash {
         return Err(format!(
             "pending submission journal {} does not match its signed transaction hash; refusing to send or replace it",
@@ -276,6 +347,9 @@ pub fn recover_pending_submission(
         json!([&hash_text]),
     )?;
     let receipt = if existing.is_null() {
+        if prepared.seed_refresh {
+            require_current_expired_seed(reader, &prepared)?;
+        }
         // Re-broadcasting the exact signed bytes is idempotent. Any RPC error
         // remains ambiguous, so receipt lookup below is still authoritative.
         let _ = reader.string_result(
@@ -308,6 +382,9 @@ pub fn send_prepared_submission(
 ) -> Result<MinedSubmission, String> {
     if parse_address(wallet.address(), "unlocked wallet address")? != prepared.miner {
         return Err("unlocked wallet does not match the prepared proof miner".to_owned());
+    }
+    if prepared.seed_refresh {
+        require_current_expired_seed(reader, &prepared)?;
     }
     let signed = sign_eip1559_transaction(wallet, &prepared.transaction)?;
     let expected_transaction_hash = signed.transaction_hash();
@@ -366,6 +443,7 @@ impl PendingSubmissionDocument {
         let fee = prepared.fee_quote;
         let tx = &prepared.transaction;
         Self {
+            seed_refresh: prepared.seed_refresh,
             version: PENDING_SUBMISSION_VERSION,
             transaction_hash: hex_string(&transaction_hash.to_bytes()),
             raw_transaction: raw_transaction.to_owned(),
@@ -395,11 +473,14 @@ impl PendingSubmissionDocument {
     }
 
     fn to_prepared(&self) -> Result<(Digest, Vec<u8>, PreparedSubmission), String> {
-        if self.version != PENDING_SUBMISSION_VERSION {
+        if self.version != 1 && self.version != PENDING_SUBMISSION_VERSION {
             return Err(format!(
                 "unsupported pending submission journal version {}",
                 self.version
             ));
+        }
+        if self.version == 1 && self.seed_refresh {
+            return Err("legacy proof journal cannot describe a seed refresh".to_owned());
         }
         let transaction_hash = parse_digest(&self.transaction_hash, "journal transactionHash")?;
         let raw_transaction = parse_hex_bytes(&self.raw_transaction, "journal rawTransaction")?;
@@ -423,6 +504,7 @@ impl PendingSubmissionDocument {
             fee_ceiling_wei: parse_u128(&self.fee_ceiling_wei, "journal feeCeilingWei")?,
         };
         let prepared = PreparedSubmission {
+            seed_refresh: self.seed_refresh,
             mining_nonce: parse_decimal_uint256(&self.mining_nonce, "journal miningNonce")?,
             account_nonce: parse_decimal_uint256(&self.account_nonce, "journal accountNonce")?,
             fee_quote,
@@ -451,6 +533,9 @@ impl PendingSubmissionDocument {
                 data: parse_hex_bytes(&self.data, "journal data")?,
             },
         };
+        if prepared.seed_refresh && prepared.transaction.data != refresh_call_data() {
+            return Err("refresh journal has invalid calldata".to_owned());
+        }
         if prepared.transaction.account_nonce != prepared.account_nonce {
             return Err(
                 "pending submission journal contains inconsistent account nonces".to_owned(),
@@ -499,6 +584,7 @@ fn mined_submission(
         ));
     }
     Ok(MinedSubmission {
+        seed_refresh: prepared.seed_refresh,
         transaction_hash,
         mining_nonce: prepared.mining_nonce,
         account_nonce: prepared.account_nonce,
@@ -808,13 +894,25 @@ fn parse_receipt(
         .and_then(Value::as_array)
         .ok_or_else(|| "proof transaction receipt is missing `logs`".to_owned())?;
     let succeeded = status == Uint256::ONE;
-    if succeeded {
+    if succeeded && !prepared.seed_refresh {
         verify_proof_accepted_event(logs, transaction_hash, block_hash, block_number, prepared)?;
     }
     let nft_token_id =
         verify_proof_nft_event(logs, transaction_hash, block_hash, block_number, prepared)?;
     let proof_nft_minted = nft_token_id.is_some();
-    if succeeded != proof_nft_minted {
+    if prepared.seed_refresh {
+        verify_seed_refreshed_event(
+            logs,
+            transaction_hash,
+            block_hash,
+            block_number,
+            prepared,
+            succeeded,
+        )?;
+        if proof_nft_minted {
+            return Err("seed refresh must not mint an NFT".to_owned());
+        }
+    } else if succeeded != proof_nft_minted {
         return Err("HunterMiningCore success requires exactly one NFT mint; reverted receipts must not mint".to_owned());
     }
     Ok(TransactionReceipt {
@@ -835,11 +933,25 @@ fn verify_mined_transaction(
     prepared: &PreparedSubmission,
 ) -> Result<(), String> {
     let transaction_hash_text = hex_string(&transaction_hash.to_bytes());
-    let value = reader.rpc_result(
-        "mined proof transaction",
-        "eth_getTransactionByHash",
-        json!([transaction_hash_text]),
-    )?;
+    let deadline = Instant::now() + RECEIPT_TIMEOUT;
+    let value = loop {
+        let value = reader.rpc_result(
+            "mined proof transaction",
+            "eth_getTransactionByHash",
+            json!([&transaction_hash_text]),
+        )?;
+        // A receipt can become visible before the transaction index catches up.
+        // Wait for inclusion fields, then retain every exact transaction check below.
+        if value.get("blockHash").is_some_and(|v| !v.is_null()) {
+            break value;
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "mined transaction inclusion fields unavailable; journal retained".to_owned(),
+            );
+        }
+        thread::sleep(RECEIPT_POLL_INTERVAL);
+    };
     let fields = value
         .as_object()
         .ok_or_else(|| "mined proof transaction must be an object".to_owned())?;
@@ -893,9 +1005,83 @@ fn verify_mined_transaction(
         &prepared.transaction.data,
     )?;
 
+    if prepared.seed_refresh {
+        let block = reader.rpc_result(
+            "canonical refresh block",
+            "eth_getBlockByNumber",
+            json!([
+                format!(
+                    "0x{:x}",
+                    uint256_to_u128(receipt.block_number, "receipt block number")?
+                ),
+                false
+            ]),
+        )?;
+        let block = block
+            .as_object()
+            .ok_or("canonical refresh block unavailable; journal retained")?;
+        require_digest_field(block, "hash", "canonical refresh block", receipt.block_hash)?;
+    }
+
     // These bindings reject an internally inconsistent RPC account. One endpoint
     // can still fabricate a fully self-consistent chain view or withhold/delay data;
     // stronger unattended assurance requires agreement from an independent endpoint.
+    Ok(())
+}
+
+fn require_current_expired_seed(
+    reader: &RpcChainReader,
+    prepared: &PreparedSubmission,
+) -> Result<(), String> {
+    if !reader.matches_deployment(prepared.transaction.chain_id, prepared.transaction.to)
+        || reader.expired_seed()? != Some((prepared.challenge_id, prepared.seed_parent_block))
+    {
+        return Err(
+            "expired seed changed; refusing a stale refresh (any pending journal is retained)"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_seed_refreshed_event(
+    logs: &[Value],
+    hash: Digest,
+    block_hash: Digest,
+    block_number: Uint256,
+    prepared: &PreparedSubmission,
+    succeeded: bool,
+) -> Result<(), String> {
+    let events = event_candidates(
+        logs,
+        event_signature(b"SeedRefreshed(uint256,uint256,uint256,uint256)"),
+    )?;
+    if events.len() != usize::from(succeeded) {
+        return Err("refresh receipt has an inconsistent SeedRefreshed event count".to_owned());
+    }
+    if !succeeded {
+        return Ok(());
+    }
+    let fields = event_fields(
+        events[0],
+        "SeedRefreshed",
+        hash,
+        block_hash,
+        block_number,
+        prepared.transaction.to,
+    )?;
+    let topics = event_topics(fields, "SeedRefreshed", 3)?;
+    require_topic_uint256(topics, 1, "expired challenge", prepared.challenge_id)?;
+    let next = prepared.challenge_id.wrapping_add(Uint256::ONE);
+    if next == Uint256::ZERO {
+        return Err("refresh challenge ID overflow".to_owned());
+    }
+    require_topic_uint256(topics, 2, "new challenge", next)?;
+    let words = event_data_words(fields, "SeedRefreshed", 2)?;
+    require_word_uint256(&words, 0, "expired seed", prepared.seed_parent_block)?;
+    if parse_uint256_word(&words[1], "new seed")? <= prepared.seed_parent_block {
+        return Err("refresh event did not advance the seed".to_owned());
+    }
     Ok(())
 }
 
@@ -1533,6 +1719,69 @@ mod tests {
         assert!(error.contains("ProofAccepted digest"), "error: {error}");
     }
 
+    #[test]
+    fn refresh_event_must_match_identity_and_never_count_as_a_proof() {
+        let mut prepared = prepared_fixture();
+        prepared.seed_refresh = true;
+        prepared.transaction.data = refresh_call_data();
+        let hash = Digest::from_bytes([0x77; 32]);
+        let block_hash = Digest::from_bytes([0x88; 32]);
+        let event = json!({
+            "address":hex_string(&prepared.transaction.to.to_bytes()),
+            "transactionHash":hex_string(&hash.to_bytes()), "blockHash":hex_string(&block_hash.to_bytes()),
+            "blockNumber":"0x15", "removed":false,
+            "topics":[hex_string(&event_signature(b"SeedRefreshed(uint256,uint256,uint256,uint256)").to_bytes()),
+                hex_string(&prepared.challenge_id.to_be_bytes()),hex_string(&prepared.challenge_id.wrapping_add(Uint256::ONE).to_be_bytes())],
+            "data":abi_data(&[prepared.seed_parent_block.to_be_bytes(), prepared.seed_parent_block.wrapping_add(Uint256::from(300_u64)).to_be_bytes()]),
+        });
+        let mut value = json!({"transactionHash":hex_string(&hash.to_bytes()), "from":hex_string(&prepared.miner.to_bytes()),
+            "to":hex_string(&prepared.transaction.to.to_bytes()), "blockHash":hex_string(&block_hash.to_bytes()), "blockNumber":"0x15",
+            "status":"0x1", "gasUsed":"0x5208", "effectiveGasPrice":"0x2", "logs":[event]});
+        let receipt = parse_receipt(&value, hash, &prepared).unwrap();
+        assert!(receipt.succeeded);
+        assert!(!receipt.proof_nft_minted);
+        let original = value.clone();
+        value["logs"][0]["topics"][1] = json!(hex_string(&Uint256::ZERO.to_be_bytes()));
+        assert!(parse_receipt(&value, hash, &prepared).is_err());
+        value = original.clone();
+        value["logs"][0]["removed"] = json!(true);
+        assert!(parse_receipt(&value, hash, &prepared).is_err());
+        value = original.clone();
+        value["logs"][0]["address"] = json!(hex_string(&[0x99; 20]));
+        assert!(parse_receipt(&value, hash, &prepared).is_err());
+        value = original.clone();
+        value["logs"] = json!([]);
+        assert!(parse_receipt(&value, hash, &prepared).is_err());
+        value["status"] = json!("0x0");
+        assert!(!parse_receipt(&value, hash, &prepared).unwrap().succeeded);
+        value = original;
+        value["status"] = json!("0x0");
+        assert!(parse_receipt(&value, hash, &prepared).is_err());
+    }
+
+    #[test]
+    fn refresh_journal_round_trip_and_legacy_proof_compatibility() {
+        let mut prepared = prepared_fixture();
+        prepared.seed_refresh = true;
+        prepared.transaction.data = refresh_call_data();
+        let mut doc = PendingSubmissionDocument::from_prepared(
+            Digest::ZERO,
+            "0x02",
+            &prepared,
+            "seedRefresh",
+            None,
+        );
+        assert!(doc.to_prepared().unwrap().2.seed_refresh);
+        doc.data = "0x12345678".to_owned();
+        assert!(doc.to_prepared().unwrap_err().contains("calldata"));
+        doc.seed_refresh = false;
+        doc.version = 1;
+        let mut legacy = serde_json::to_value(doc).unwrap();
+        legacy.as_object_mut().unwrap().remove("seedRefresh");
+        let legacy: PendingSubmissionDocument = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.to_prepared().unwrap().2.seed_refresh);
+    }
+
     fn prepared_fixture() -> PreparedSubmission {
         let miner = Address::from_bytes([0x11; 20]);
         let mining_core = Address::from_bytes([0x22; 20]);
@@ -1549,6 +1798,7 @@ mod tests {
             nonce: mining_nonce,
         });
         PreparedSubmission {
+            seed_refresh: false,
             mining_nonce,
             account_nonce: Uint256::ZERO,
             fee_quote: fee_quote(1, 1, 21_000, 25, u128::MAX).unwrap(),

@@ -332,6 +332,24 @@ impl RpcChainReader {
         self.verified_block_tag().map(drop)
     }
 
+    /// An expired identity pinned to a verified RPC block; no seed hash is required.
+    pub(crate) fn expired_seed(&self) -> Result<Option<(Uint256, Uint256)>, String> {
+        let tag = self.verified_block_tag()?;
+        if ChallengeStatus::from_word(self.call_word("challengeState()", &tag)?)?
+            != ChallengeStatus::Expired
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.call_word("activeChallengeId()", &tag)?,
+            self.call_word("activeSeedParentBlock()", &tag)?,
+        )))
+    }
+
+    pub(crate) fn matches_deployment(&self, chain_id: Uint256, core: Address) -> bool {
+        chain_id == self.expected_chain_id && core == self.mining_core_address
+    }
+
     pub(crate) fn read_challenge_marker(&self) -> Result<ChallengeMarker, String> {
         let block_tag =
             self.string_result("watcher snapshot block", "eth_blockNumber", json!([]))?;
