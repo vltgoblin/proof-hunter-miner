@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 
 def rpc(url, method, params):
-    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json'})
+    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json','User-Agent':'ProofHuntersCLI/0.2.0'})
     with urllib.request.urlopen(request, timeout=20) as response:
         result = json.load(response)
     if 'error' in result or 'result' not in result:
