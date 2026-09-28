@@ -22,7 +22,7 @@ const SAMPLE_STATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/
 const RPC_FIXTURE: &str = include_str!("fixtures/rpc-chain-state.json");
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RecordedExchange {
     request: Value,
     response: Value,
@@ -779,10 +779,16 @@ fn spawn_recorded_rpc_server(with_power: bool) -> (String, JoinHandle<()>) {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        exchanges.push(RecordedExchange {
+        let no_module = RecordedExchange {
             request: json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x5fbdb2315678afecb367f032d93f642f64180aa3","data":data},"0x3ec"]}),
             response: json!({"jsonrpc":"2.0","id":1,"result":format!("0x{}", "0".repeat(64))}),
-        });
+        };
+        // A live search first asks which proof path the core's module wants
+        // (identity, then miningPower()); no module keeps the direct path.
+        let mut prefix = exchanges[..3].to_vec();
+        prefix.push(no_module.clone());
+        exchanges.splice(0..0, prefix);
+        exchanges.push(no_module);
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("fixture server must bind");
     let endpoint = format!(

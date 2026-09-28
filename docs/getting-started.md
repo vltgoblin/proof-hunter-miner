@@ -3,13 +3,13 @@
 ## Choose the available mining path
 
 The [browser miner](https://app.proofhunter.fun/app/mine) and mainnet protocol are live.
-Use the **v0.2.3** CLI release or current reviewed source. **v0.1.0 is legacy** and
-must not be used for NFT mining.
+Use the **v0.3.0** CLI release or current reviewed source. Mining was upgraded on
+28 Sep 2026; **v0.2.3 cannot mine** on the upgraded system and **v0.1.0 is legacy**.
 
 ## Download a release bundle
 
 Get `proof-hunters-<system>.zip` and `SHA256SUMS` from
-[the v0.2.3 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.3).
+[the v0.3.0 release](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.3.0).
 Choose `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64` or
 `windows-x86_64`. Follow [release verification](verifying-a-release.md) before
 extracting or running it. Python 3.9+ is required for the launcher.
@@ -43,6 +43,7 @@ export RPC_URL=https://rpc.mainnet.chain.robinhood.com
 export CHAIN_ID=4663
 export MINING_CORE=0xf213854c6d5d4334d23d452574556bd53ca24c2c
 export BASKET=0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC
+export ROUTER=0x724b77b12b63217b5379c31a713017404175bac7
 ./target/release/bproof status --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --json
 ```
 
@@ -55,7 +56,24 @@ Status is read-only and needs no wallet. Compare these settings with the [mainne
 ./target/release/bproof wallet address --keystore ./mainnet-miner.json --json
 ```
 
-Choose the passphrase locally. Keep the recovery file private and offline. Send a deliberately limited amount of **mainnet ETH** from MetaMask to the printed mining address. The CLI signs with this wallet, and accepted proofs mint NFTs to it. HUNTER, USDG and NVDA are not gas, and holding them is not required to start base mining.
+Choose the passphrase locally. Keep the recovery file private and offline. Send a deliberately limited amount of **mainnet ETH** from MetaMask to the printed mining address. The CLI signs with this wallet, and accepted proofs mint Hunter NFTs to it. HUNTER tokens, USDG and NVDA are not gas.
+
+## Stake to the CLI wallet
+
+A wallet must be staked to mine. In the app at
+[app.proofhunter.fun/app/mine](https://app.proofhunter.fun/app/mine), stake **1M HUNTER
+tokens** to the exact address printed by `bproof wallet address`. The CLI never stakes,
+approves or moves tokens for you. Stake can be withdrawn 3 days after it is added.
+
+The CLI checks the stake before it unlocks the wallet or sends anything. If the wallet
+is not staked it sends nothing, exits with code 4 and says:
+
+```text
+Not staked: Stake 1M HUNTER tokens to this wallet in the app: app.proofhunter.fun/app/mine (your CLI wallet address: 0x…).
+```
+
+New stake becomes active shortly after it lands; until then the CLI keeps mining and
+says `Your stake becomes active soon. Mining continues.`
 
 ## Authorise one bounded search
 
@@ -63,16 +81,32 @@ This is a transaction-capable command. Choose a per-transaction fee ceiling befo
 
 ```sh
 export MAX_TOTAL_FEE_WEI=100000000000000
-./target/release/bproof mine --submit --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --basket "$BASKET" --keystore ./mainnet-miner.json --max-fee "$MAX_TOTAL_FEE_WEI" --max-attempts 1000000 --threads 2 --json
+./target/release/bproof mine --submit --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" --mining-core "$MINING_CORE" --basket "$BASKET" --router "$ROUTER" --keystore ./mainnet-miner.json --max-fee "$MAX_TOTAL_FEE_WEI" --max-attempts 1000000 --threads 2 --json
 ```
 
 The example ceiling is 0.0001 ETH, not a recommended budget. `--max-fee` caps total gas exposure for **one transaction**, not gas price or cumulative session spending. The release launcher calls this option `--max-fee-wei`. A search may finish without finding a proof.
 
+The CLI submits a proof only when the network would accept it from this wallet right
+now, so it does not pay gas for a proof that would be refused. Another miner can still
+win first, and a reverted transaction can still cost gas. A run that ends without
+sending anything exits with code 4 and a plain `status`: `notStaked`, `stakePending`,
+`waiting` or `paused`. `--router` pins the mining router from the release profile; the
+CLI refuses to mine if the core reports a different one. Without it, the CLI reads the
+router from the core.
+
+While the wallet is staked, `--loop` also sends occasional network upkeep
+transactions, as the app does: each is simulated first, sent after a short random
+delay, stays within `--max-fee`, and never while a proof is being submitted. They
+are logged as `upkeepSent` (with `kind`) or a neutral `upkeepSkipped`, and never stop
+mining. `--no-upkeep` turns them off. One-shot runs, including the launcher, never
+send them.
+
 The native `--loop` option has no total-run spending cap. Do not treat the per-transaction limit as a run-wide budget. Preserve pending journals after crashes or uncertain RPC replies so the CLI can reconcile the exact signed transaction.
 
-## Mining Power and agents
+## Agents and the old HUNTER boost
 
-The CLI automatically uses Mining Power assigned to its mining wallet. HUNTER must be deposited in MiningPowerCustody and assigned to the exact address printed by `bproof wallet address`. The app’s current assignment shortcut selects its browser mining wallet; it cannot target a different CLI wallet. New assignments apply from the next challenge; loose balances do not count. No assignment means 1x. Continuous `searchStarted` events report `baseTarget`, effective `target`, and `powerMultiplierWad` (1e18 = 1x). The CLI does not sign token approvals, deposits or assignments.
+The old HUNTER boost (MiningPowerCustody) is withdraw-only since the 27 Sep 2026 pause:
+HUNTER tokens assigned there no longer affect mining. Withdraw them from the app at any time.
 
 An agent needs an explicitly selected network, a bounded run count and a spending limit. Never paste a private key, passphrase or recovery phrase into chat. The agent skill is operating guidance, not an isolation boundary or evidence of a released binary.
 
@@ -88,28 +122,13 @@ python3 proof-hunters --network mainnet mine --confirm-mainnet --keystore ./main
 This performs at most one proof submission. The fee is an example, not a recommended
 spend. It never silently switches networks. A failed proof search can return no NFT.
 
-## Assign power to a CLI wallet
-
-Check the CLI wallet address first. Using your funding wallet and a contract interface
-that lets you choose the mining recipient, the contract sequence is:
-
-1. Approve the verified MiningPowerCustody address to spend the exact HUNTER amount.
-2. Call `deposit(amount)` on that custody from the funding wallet.
-3. Call `assign(cliMiningWallet, amount)` from the same funding wallet.
-
-Use raw token units (HUNTER has 18 decimals). Read the custody address from the
-verified core's `miningPower()` and verify its `HUNTER()` matches the canonical
-token before approving. Keep the funding wallet distinct from the mining wallet.
-The existing app button targets the browser wallet, so do not use it for a
-different CLI address. The CLI itself does not sign these custody transactions.
-Once assigned and eligible, `mine` uses the boost automatically.
-
 ## Automatic seed refresh
 
-Expired seeds are refreshed automatically when `mine --submit` is authorized.
-A one-shot run sends only the refresh, reports `seedRefreshed`, and exits; invoke
-it again after the seed becomes readable to mine. With `--loop`, the miner waits
-for the new seed and resumes itself. Read-only commands never refresh or spend.
+An expired round is refreshed automatically when `mine --submit` is authorized and the
+network allows the next round; until then the CLI waits and sends nothing. A one-shot
+run sends only the refresh, reports `seedRefreshed`, and exits; invoke it again after
+the seed becomes readable to mine. With `--loop`, the miner waits for the new seed and
+resumes itself. Read-only commands never refresh or spend.
 The refresh uses the same per-transaction `--max-fee` ceiling, has zero ETH value,
 and mints no NFT. Another miner can win the refresh race; a reverted transaction
 can still cost gas. Refresh fees are included in the loop's total fees.
@@ -117,5 +136,10 @@ can still cost gas. Refresh fees are included in the loop's total fees.
 An unresolved refresh is journaled before broadcast and reconciled on restart.
 If the seed changed and no receipt is available, recovery refuses to rebroadcast
 stale refresh bytes and keeps the journal for investigation. Never clear it to
-force another transaction. Version 2 journals support proof and refresh calls;
-existing version 1 proof journals remain readable.
+force another transaction. v0.3.0 writes version 3 journals for router submissions;
+version 1 and 2 journals remain readable. Do not downgrade while a journal is pending.
+
+## If mining is paused
+
+If mining is paused on chain, the CLI prints the pause notice and when it ends. A
+one-shot run exits with code 4; `--loop` waits and resumes by itself.

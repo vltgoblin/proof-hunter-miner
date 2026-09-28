@@ -60,9 +60,31 @@ class LauncherTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError,'Missing release checksum'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
  def test_rpc_identifies_cli_to_public_provider(self):
   def respond(request, timeout):
-   self.assertEqual(request.get_header('User-agent'),'ProofHuntersCLI/0.2.2')
+   self.assertEqual(request.get_header('User-agent'),'ProofHuntersCLI/0.3.0')
    self.assertEqual(json.loads(request.data)['method'],'eth_chainId')
    return io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":"0x1237"}')
   with patch.object(m.urllib.request,'urlopen',side_effect=respond):
    self.assertEqual(m.rpc('https://example.invalid','eth_chainId',[]),'0x1237')
+ def mining_profile(self):
+  self.profile.update(stake='0x'+'3'*40,router='0x'+'4'*40,stakeCodeSha256=hashlib.sha256(b'\x60\x00').hexdigest(),routerCodeSha256=hashlib.sha256(b'\x60\x00').hexdigest())
+ def test_router_is_pinned_for_mining_and_its_code_is_checked(self):
+  self.mining_profile();self.save();seen=[]
+  def rpc(url,method,params):
+   seen.append(params[0] if method=='eth_getCode' else method)
+   return hex(46630) if method=='eth_chainId' else '0x6000'
+  command=m.prepare(self.args,rpc)
+  self.assertEqual(command[command.index('--router')+1],'0x'+'4'*40)
+  self.assertIn('0x'+'3'*40,seen);self.assertIn('0x'+'4'*40,seen)
+ def test_router_bytecode_mismatch_refuses(self):
+  self.mining_profile();self.save()
+  def rpc(url,method,params):
+   if method=='eth_chainId':return hex(46630)
+   return '0x6001' if params[0]=='0x'+'4'*40 else '0x6000'
+  with self.assertRaisesRegex(ValueError,'bytecode mismatch: router'):m.prepare(self.args,rpc)
+ def test_named_router_needs_its_code_checksum(self):
+  self.mining_profile();self.profile['routerCodeSha256']=None;self.save()
+  with self.assertRaisesRegex(ValueError,'Missing release checksum: routerCodeSha256'):m.prepare(self.args,lambda *a:self.fail('RPC called'))
+ def test_status_never_passes_mining_flags(self):
+  self.mining_profile();self.save();self.args.command='status';self.args.keystore=None
+  command=m.prepare(self.args,self.rpc);self.assertNotIn('--router',command);self.assertNotIn('--submit',command)
 if __name__=='__main__':unittest.main()

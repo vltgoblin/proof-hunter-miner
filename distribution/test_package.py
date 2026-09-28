@@ -25,6 +25,15 @@ class PackageTests(unittest.TestCase):
                 self.assertFalse(source["ready"])
                 self.assertIsNone(source["binarySha256"])
 
+    def test_bundle_pins_the_mining_router_and_stake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory)/"bproof"
+            binary.write_bytes(b"fixture binary, never a real release")
+            profile = package(binary, "linux-x86_64", Path(directory)/"bundle.zip")
+            for key in ("stake", "router"):
+                self.assertRegex(profile[key], r"^0x[0-9a-fA-F]{40}$")
+                self.assertRegex(profile[key + "CodeSha256"], r"^[0-9a-f]{64}$")
+
     def test_rejects_empty_or_unsupported_package(self):
         with tempfile.TemporaryDirectory() as directory:
             binary=Path(directory)/"empty"

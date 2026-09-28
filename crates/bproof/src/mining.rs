@@ -7,7 +7,9 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-use proof_core::{Address, ChallengeInputs, Digest, SearchResult, Target, Uint256, search_nonce};
+use proof_core::{
+    Address, ChallengeInputs, Digest, SearchResult, Target, Uint256, search_nonce_above,
+};
 
 // Keep cancellation responsive without forcing every worker through the
 // coordinator after only a few hundred hashes.  The smaller batch left most
@@ -40,6 +42,8 @@ impl MiningControl {
 pub struct MiningRequest {
     pub challenge_inputs: ChallengeInputs,
     pub miner: Address,
+    /// Exclusive lower bound: when set, a digest must also be above it.
+    pub floor: Option<Target>,
     pub target: Target,
     pub start_nonce: Uint256,
     pub threads: usize,
@@ -86,6 +90,7 @@ struct WorkerContext {
     step: Uint256,
     challenge_inputs: ChallengeInputs,
     miner: Address,
+    floor: Option<Target>,
     target: Target,
     stop: Arc<AtomicBool>,
     reports: Sender<WorkerReport>,
@@ -123,9 +128,10 @@ pub fn mine_with_control(
         });
     }
 
-    let first = search_nonce(
+    let first = search_nonce_above(
         request.challenge_inputs,
         request.miner,
+        request.floor,
         request.target,
         request.start_nonce,
         step,
@@ -187,6 +193,7 @@ pub fn mine_with_control(
                 step,
                 challenge_inputs: request.challenge_inputs,
                 miner: request.miner,
+                floor: request.floor,
                 target: request.target,
                 stop: Arc::clone(&stop),
                 reports: reports_tx.clone(),
@@ -245,9 +252,10 @@ fn worker_loop(
 
         match commands.recv() {
             Ok(WorkerCommand::Search(budget)) => {
-                let result = search_nonce(
+                let result = search_nonce_above(
                     context.challenge_inputs,
                     context.miner,
+                    context.floor,
                     context.target,
                     next_nonce,
                     context.step,
@@ -312,9 +320,33 @@ fn coordinate_batches(
 
         let mut winners = Vec::new();
         for _ in 0..active_workers.len() {
-            let report = reports
-                .recv()
-                .map_err(|_| "a mining worker stopped before reporting its batch".to_owned())?;
+            let report = match reports.recv() {
+                Ok(report) => report,
+                // A stop can land between a batch command and a worker picking it up;
+                // that worker then exits without a report. Keep any proof already in.
+                Err(_) if stop.load(Ordering::Acquire) => {
+                    return Ok(
+                        match winners
+                            .into_iter()
+                            .min_by_key(|winner: &(Uint256, Digest)| winner.0)
+                        {
+                            Some((nonce, digest)) => MiningResult::Found {
+                                mining_nonce: nonce,
+                                digest,
+                                attempts: total_attempts,
+                                threads: configured_threads,
+                            },
+                            None => MiningResult::Abandoned {
+                                attempts: total_attempts,
+                                threads: configured_threads,
+                            },
+                        },
+                    );
+                }
+                Err(_) => {
+                    return Err("a mining worker stopped before reporting its batch".to_owned());
+                }
+            };
             let worker = workers
                 .iter_mut()
                 .find(|worker| worker.worker_id == report.worker_id)
@@ -414,6 +446,7 @@ mod tests {
             MiningRequest {
                 challenge_inputs: challenge(1),
                 miner: Address::from_bytes([0x11; 20]),
+                floor: None,
                 target: Target::from_be_bytes([0; 32]),
                 start_nonce: Uint256::ZERO,
                 threads: 2,
@@ -428,6 +461,7 @@ mod tests {
         let current = mine(MiningRequest {
             challenge_inputs: challenge(2),
             miner: Address::from_bytes([0x11; 20]),
+            floor: None,
             target: Target::from_be_bytes([0xff; 32]),
             start_nonce: Uint256::ZERO,
             threads: 2,

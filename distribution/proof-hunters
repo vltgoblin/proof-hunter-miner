@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 
 def rpc(url, method, params):
-    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json','User-Agent':'ProofHuntersCLI/0.2.2'})
+    request = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(), headers={'Content-Type':'application/json','User-Agent':'ProofHuntersCLI/0.3.0'})
     with urllib.request.urlopen(request, timeout=20) as response:
         result = json.load(response)
     if 'error' in result or 'result' not in result:
@@ -35,10 +35,15 @@ def prepare(args, call=rpc):
     url = urlsplit(profile['rpcUrl'])
     if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
         raise ValueError('Profile RPC must use HTTPS without embedded credentials')
-    for key in ['miningCore','basket']:
-        if not re.fullmatch(r'0x[0-9a-fA-F]{40}',profile[key]) or int(profile[key],16)==0:
+    # Mining contracts pinned by the profile: the core and basket always; the stake
+    # module and router when the profile names them (checked like the core).
+    contracts=[('miningCore','coreCodeSha256'),('basket','basketCodeSha256')]
+    if profile.get('router') is not None or profile.get('stake') is not None:
+        contracts+=[('stake','stakeCodeSha256'),('router','routerCodeSha256')]
+    for key,_ in contracts:
+        if not isinstance(profile.get(key),str) or not re.fullmatch(r'0x[0-9a-fA-F]{40}',profile[key]) or int(profile[key],16)==0:
             raise ValueError('Invalid '+key)
-    for key in ['coreCodeSha256','basketCodeSha256','binarySha256']:
+    for key in [digest for _,digest in contracts]+['binarySha256']:
         if not isinstance(profile.get(key),str) or not re.fullmatch(r'[0-9a-f]{64}',profile[key]):
             raise ValueError('Missing release checksum: '+key)
     binary = ROOT/('bproof.exe' if os.name == 'nt' else 'bproof')
@@ -46,7 +51,7 @@ def prepare(args, call=rpc):
         raise ValueError('CLI binary does not match the cleared release checksum')
     if int(call(profile['rpcUrl'],'eth_chainId',[]),16)!=profile['chainId']:
         raise ValueError('RPC chain mismatch')
-    for address, digest in [('miningCore','coreCodeSha256'),('basket','basketCodeSha256')]:
+    for address, digest in contracts:
         code=call(profile['rpcUrl'],'eth_getCode',[profile[address],'latest'])
         if not re.fullmatch(r'0x(?:[0-9a-fA-F]{2})+',code) or hashlib.sha256(bytes.fromhex(code[2:])).hexdigest()!=profile[digest]:
             raise ValueError('Contract bytecode mismatch: '+address)
@@ -55,6 +60,7 @@ def prepare(args, call=rpc):
         if not args.keystore or not args.max_fee_wei or not re.fullmatch(r'[1-9][0-9]*',args.max_fee_wei):
             raise ValueError('Mining requires --keystore and a positive --max-fee-wei')
         command += ['--submit','--basket',profile['basket'],'--keystore',args.keystore,'--max-fee',args.max_fee_wei,'--max-attempts',str(args.max_attempts)]
+        if profile.get('router') is not None: command += ['--router',profile['router']]
         if args.passphrase_file: command += ['--passphrase-file',args.passphrase_file]
         if args.threads: command += ['--threads',str(args.threads)]
     return command

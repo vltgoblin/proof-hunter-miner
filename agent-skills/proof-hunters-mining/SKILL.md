@@ -1,12 +1,12 @@
 ---
 name: proof-hunters-mining
-description: Inspect Proof Hunters mining status and operate its verified CLI for explicitly authorized, bounded Hunter NFT mining on Robinhood Chain. Use for CLI setup, mining attempts, assigned HUNTER boosts, expired-seed recovery, or pending mining transactions.
+description: Inspect Proof Hunters mining status and operate its verified CLI for explicitly authorized, bounded Hunter NFT mining on Robinhood Chain. Use for CLI setup, mining attempts, stake checks, expired-seed recovery, or pending mining transactions.
 license: MIT
 ---
 
 # Proof Hunters mining
 
-Use the public `proof-hunters` profile launcher with its matching `bproof` binary. Tested interface: release **v0.2.3**. Mainnet is live on Robinhood Chain **4663**; released mainnet profiles are enabled, while source templates and testnet profiles are disabled. Do not invent addresses or edit profiles/checksums to bypass checks.
+Use the public `proof-hunters` profile launcher with its matching `bproof` binary. Tested interface: release **v0.3.0** (v0.2.3 cannot mine since the 28 Sep 2026 upgrade). Mainnet is live on Robinhood Chain **4663**; released mainnet profiles are enabled, while source templates and testnet profiles are disabled. Do not invent addresses or edit profiles/checksums to bypass checks.
 
 ## Inspect first
 
@@ -16,7 +16,7 @@ Read [setup and commands](references/operations.md) before operating. Locate a v
 
 Before any mining submission, establish the network, dedicated mining wallet, per-transaction gas ceiling in wei, maximum call count, total gas budget, and CPU thread/attempt limits. Honor existing explicit authorization; ask only for missing limits. Mainnet authorization is separate from testnet. Explain that mining may send a zero-value seed refresh that costs gas but mints no NFT.
 
-Prefer a single bounded launcher call. For multiple calls, ensure `maximum calls × per-transaction ceiling ≤ authorized total gas budget`, track calls and results, and stop at either limit. The CLI ceiling is per transaction, **not** a session budget. Do not use an unlimited `--loop`, automatically refill gas, buy tokens, lock/assign HUNTER, or transfer NFTs without separate authorization. Never choose a spending amount for the user.
+Prefer a single bounded launcher call. For multiple calls, ensure `maximum calls × per-transaction ceiling ≤ authorized total gas budget`, track calls and results, and stop at either limit. The CLI ceiling is per transaction, **not** a session budget. Do not use an unlimited `--loop`, automatically refill gas, buy tokens, stake or move HUNTER tokens, or transfer NFTs without separate authorization. Never choose a spending amount for the user.
 
 ## Protect wallet access
 
@@ -29,7 +29,7 @@ Run the bounded command in the reference with the user's actual limits. Read the
 - Search exhaustion is normal; no NFT was minted.
 - `seedRefreshed` means a paid refresh, **not** an NFT. A one-shot call exits after refreshing. A later authorized call can mine once the seed is readable; do not retry in a tight loop.
 - A failed or reverted transaction may still spend gas. Do not count it as a free call.
-- Assigned HUNTER power is read automatically from the core-selected module. Tokens must be locked and assigned to the **exact CLI mining address**; wallet balances alone give no boost. New assignments apply from the next challenge. The app's assignment shortcut targets its browser miner, not a different CLI wallet. Do not claim a boost from an amount typed into a form.
+- A wallet must be staked to mine: 1M HUNTER tokens staked to the **exact CLI mining address** in the app (app.proofhunter.fun/app/mine). The CLI never stakes. Exit code 4 means nothing was sent; report its `status` (`notStaked`, `stakePending`, `waiting` or `paused`) and `message` as printed. `notStaked` needs the human to stake in the app; do not stake on their behalf.
 - Each accepted proof mints a Hunter NFT, not liquid HUNTER. `schedule` and offline fixtures are not the live reward model. Do not promise a win, equal device performance, or a collection completion date.
 
 ## Recover without duplicate sends

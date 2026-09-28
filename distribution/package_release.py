@@ -18,9 +18,12 @@ def package(binary, target, output):
     profile = json.loads((ROOT / "profiles/mainnet.json").read_text())
     if profile.get("chainId") != 4663 or profile.get("network") != "mainnet":
         raise ValueError("Mainnet profile must use chain 4663")
-    for key in ("coreCodeSha256", "basketCodeSha256"):
-        if not re.fullmatch(r"[0-9a-f]{64}", profile.get(key, "")):
+    for key in ("coreCodeSha256", "basketCodeSha256", "stakeCodeSha256", "routerCodeSha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", profile.get(key) or ""):
             raise ValueError("Missing deployed code checksum")
+    for key in ("miningCore", "basket", "stake", "router"):
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", profile.get(key) or "") or int(profile[key], 16) == 0:
+            raise ValueError("Missing deployed contract address")
     profile.update(ready=True, reason="Packaged with the matching release binary.", binarySha256=hashlib.sha256(contents).hexdigest())
     name = "bproof.exe" if target.startswith("windows") else "bproof"
     entries = {name: contents, "profiles/mainnet.json": (json.dumps(profile, indent=2)+"\n").encode()}

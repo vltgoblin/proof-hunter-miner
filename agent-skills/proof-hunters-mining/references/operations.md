@@ -2,7 +2,7 @@
 
 ## Verify the release
 
-Use the platform ZIP from [v0.2.3](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.3), which contains `bproof`, the Python launcher, and matching profiles. Verify the ZIP against the release's `SHA256SUMS` **and** its GitHub build attestation before running it:
+Use the platform ZIP from [v0.3.0](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.3.0), which contains `bproof`, the Python launcher, and matching profiles. Verify the ZIP against the release's `SHA256SUMS` **and** its GitHub build attestation before running it:
 
 ```sh
 gh attestation verify /absolute/path/to/downloaded.zip --repo vltgoblin/proof-hunter-miner
@@ -21,7 +21,7 @@ python3 "$RELEASE_DIR/proof-hunters" --network mainnet profile
 python3 "$RELEASE_DIR/proof-hunters" --network mainnet status
 ```
 
-`profile` displays configuration. `status` checks the binary checksum, RPC chain ID, and deployed core/basket runtime hashes before querying mining state. These checks rely on an authentic release and trusted RPC; they are not an independent chain proof. Public configuration is also available at [release.json](https://app.proofhunter.fun/release.json). Never copy testnet/RC fixtures into a mainnet profile.
+`profile` displays configuration. `status` checks the binary checksum, RPC chain ID, and deployed core, basket, stake-module and router runtime hashes before querying mining state. These checks rely on an authentic release and trusted RPC; they are not an independent chain proof. Public configuration is also available at [release.json](https://app.proofhunter.fun/release.json). Never copy testnet/RC fixtures into a mainnet profile.
 
 An expired or not-yet-readable seed can produce `challenge unavailable` with exit code 2. It is not a confirmed mint or an authorization to spend. Check the actual error before diagnosing the network as disabled.
 
@@ -50,12 +50,12 @@ python3 "$RELEASE_DIR/proof-hunters" --network mainnet mine \
 
 An authorized unattended call may append `--passphrase-file "$PASSPHRASE_FILE_PATH"`; pass only the path, never its contents. The launcher performs profile checks and submits at most one transaction per ordinary call: either a proof or an expired-seed refresh. `--max-attempts` limits hashing, not gas. Recovery may reconcile an earlier journaled transaction before a new attempt, so treat unresolved outcomes separately and never assume a retry is free or safe to bypass.
 
-Read both JSON and exit status. Exit 0 alone does not prove a mint: `seedRefreshed` has `proofClassification: seedRefresh` and `nftTokenId: null`. Exit 1 can mean exhausted search, 2 can mean an error/unavailable challenge, and 3 can mean fee refusal. Inspect the actual output. Do not invent balances, hash rates, proof IDs, transaction hashes, or confirmations.
+Read both JSON and exit status. Exit 0 alone does not prove a mint: `seedRefreshed` has `proofClassification: seedRefresh` and `nftTokenId: null`. Exit 1 can mean exhausted search, 2 can mean an error/unavailable challenge, 3 can mean fee refusal, and 4 means nothing was sent (`status`: `notStaked`, `stakePending`, `waiting` or `paused`). Inspect the actual output. Do not invent balances, hash rates, proof IDs, transaction hashes, or confirmations.
 
 For repeated calls, keep a run ledger with authorized ceilings, calls used, confirmed results, and unresolved transactions. Reserve the full fee ceiling per new call; never exceed the authorized total. Stop on unknown submission, lost RPC replies, or journal failure. Do not start another call just because a process timed out. Rerunning the same CLI/wallet for recovery must preserve the journal and original transaction identity.
 
-## HUNTER power and seed refresh
+## Stake and seed refresh
 
-v0.2.3 reads assigned mining power automatically. A failed power read stops search instead of silently substituting base power. The exact CLI mining address must receive the assignment; holding HUNTER in MetaMask is insufficient. Base power still permits mining without a lock. Locking, allowances, and assignment are separate transactions requiring their own authorization and verified custody configuration. This skill does not construct those transactions.
+A wallet must be staked to mine. The human stakes 1M HUNTER tokens to the exact CLI mining address in the app (app.proofhunter.fun/app/mine); holding HUNTER in MetaMask is not enough. The CLI checks the stake before unlocking the wallet and exits with code 4 and `status: notStaked` if it is missing, sending nothing. It submits a proof only when the chain says it would be accepted for this wallet now; otherwise a call can end with exit 4 `waiting`, which is not a failure and costs no gas. This skill never stakes, approves or moves tokens. The old HUNTER boost (MiningPowerCustody) is withdraw-only. A staked `--loop` also sends occasional zero-value network upkeep transactions within the per-transaction ceiling (`upkeepSent`); count their fees against the budget, or pass `--no-upkeep`. One-shot launcher calls never send them.
 
-A one-shot expired-seed refresh uses the same gas ceiling, carries zero ETH value, and exits without an NFT. Another miner may refresh first; a reverted refresh can cost gas. After confirmation, wait for the new seed to become readable and use a later authorized bounded call. Read-only status never refreshes. Preserve pending journals across restarts; never downgrade a v2 refresh journal or erase it to force progress.
+A one-shot expired-seed refresh happens only when the network allows the next round; it uses the same gas ceiling, carries zero ETH value, and exits without an NFT. Another miner may refresh first; a reverted refresh can cost gas. After confirmation, wait for the new seed to become readable and use a later authorized bounded call. Read-only status never refreshes. Preserve pending journals across restarts; never downgrade a pending v2 or v3 journal to an older CLI or erase it to force progress.

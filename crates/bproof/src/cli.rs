@@ -12,8 +12,8 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::chain::{
-    CHAIN_STATE_SOURCE, ChainReader, FILE_STATE_SOURCE, FileChainReader, MiningState,
-    RpcChainReader,
+    CHAIN_STATE_SOURCE, ChainReader, ChallengeStatus, FILE_STATE_SOURCE, FileChainReader,
+    HuntContracts, MiningMode, MiningState, RpcChainReader,
 };
 use crate::classification::{NftClassificationSnapshot, ProofClassification, classify_proof};
 use crate::continuous::{ContinuousRequest, DEFAULT_WATCH_INTERVAL};
@@ -30,16 +30,16 @@ use crate::parse::{
     parse_u64, parse_u128, uint256_to_decimal,
 };
 use crate::submit::{
-    FEE_REFUSAL_EXIT_CODE, FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome,
-    SUBMISSION_WARNING, prepare_seed_refresh, prepare_submission, recover_pending_submission,
-    send_prepared_submission,
+    ClaimRoute, FEE_REFUSAL_EXIT_CODE, FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING,
+    PreparationOutcome, SUBMISSION_WARNING, prepare_claim, prepare_seed_refresh,
+    prepare_submission, recover_pending_submission, send_prepared_submission,
 };
 use bproof::keystore::{
     PassphraseSource, create_keystore, read_keystore_address, read_passphrase, unlock_keystore,
     write_recovery_phrase,
 };
 
-const EXIT_CODE_HELP: &str = "Exit codes:\n  0  Command succeeded, or a continuous loop stopped cleanly\n  1  Verify rejected the proof, mine exhausted, or a continuous loop reached its repeated-failure limit\n  2  Usage or input parse error; also a continuous identity or keystore failure\n  3  Submission refused because maximum exposure exceeds --max-fee in single-shot mode; continuous mining reports feeRefused and continues";
+const EXIT_CODE_HELP: &str = "Exit codes:\n  0  Command succeeded, or a continuous loop stopped cleanly\n  1  Verify rejected the proof, mine exhausted, or a continuous loop reached its repeated-failure limit\n  2  Usage or input parse error; also a continuous identity or keystore failure\n  3  Submission refused because maximum exposure exceeds --max-fee in single-shot mode; continuous mining reports feeRefused and continues\n  4  Nothing was sent: the wallet is not staked, mining is paused, or mining is waiting for the next round";
 
 /// Deterministic, non-custodial Bonded Proof utilities.
 #[derive(Debug, Parser)]
@@ -216,7 +216,7 @@ struct MineArgs {
     /// Continuously read, search, simulate, and submit. Requires --submit.
     #[arg(
         long = "loop",
-        long_help = "Continuously read, search, simulate, and submit. Requires --submit. Expired seeds are automatically refreshed within --max-fee, then mining resumes. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, seedRefreshStarted, seedRefreshed, seedRefreshRecovered, seedRefreshFeeRefused, rpcRetry, failure, and summary. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
+        long_help = "Continuously read, search, simulate, and submit. Requires --submit. Expired seeds are automatically refreshed within --max-fee when the next round is open, then mining resumes. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, seedRefreshStarted, seedRefreshed, seedRefreshRecovered, seedRefreshFeeRefused, stakePending, notStaked, miningPaused, upkeepSent, upkeepSkipped, upkeepRecovered, submissionPending, rpcRetry, failure, and summary. While staked on the upgraded system the loop also sends occasional network upkeep transactions within --max-fee; --no-upkeep turns them off. A wallet that is not staked stops with exit code 4 before anything is sent; a pause waits and resumes by itself. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
     )]
     loop_mode: bool,
     /// Milliseconds between live challenge checks; defaults to 1000.
@@ -234,6 +234,12 @@ struct MineArgs {
     /// Basket asset address for HunterMiningCore.submitProof. Required with --submit.
     #[arg(long)]
     basket: Option<String>,
+    /// Expected mining router address, pinned by the release profile. Without it the router is read from the core.
+    #[arg(long)]
+    router: Option<String>,
+    /// With --loop: send no network upkeep transactions (sent by default, each within --max-fee).
+    #[arg(long)]
+    no_upkeep: bool,
     /// Override the chain base fee per gas in raw wei.
     #[arg(long)]
     base_fee_per_gas: Option<String>,
@@ -259,6 +265,9 @@ struct SubmitArgs {
     /// Basket asset address for HunterMiningCore.submitProof as exactly 20 bytes of 0x-prefixed hex.
     #[arg(long)]
     basket: String,
+    /// Expected mining router address, pinned by the release profile. Without it the router is read from the core.
+    #[arg(long)]
+    router: Option<String>,
     /// Found mining nonce as decimal u128 or exactly 32 bytes of 0x-prefixed hex.
     #[arg(long)]
     mining_nonce: String,
@@ -434,6 +443,10 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
     if args.loop_mode {
         return run_continuous_mine(&args, miner, submission, json);
     }
+    let expected_router = parse_router(args.router.as_deref())?;
+    if args.router.is_some() && args.rpc_url.is_none() {
+        return Err("--router requires --rpc-url".to_owned());
+    }
     if let Some(submission) = &submission {
         let endpoint = args
             .rpc_url
@@ -455,6 +468,13 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
                 recovered.classification_reason,
                 json,
             );
+        }
+        match reader.mining_mode(expected_router)? {
+            MiningMode::Paused { resume_at } => return Ok(paused_result(resume_at, json)),
+            MiningMode::Hunt(contracts) => {
+                return run_hunt_mine(&args, &reader, miner, submission, contracts, json);
+            }
+            MiningMode::Direct => {}
         }
         if let Some(expired) = reader.expired_seed()? {
             let prepared = match prepare_seed_refresh(
@@ -494,6 +514,26 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
             )?;
             return submission_result(mined, miner, "seedRefresh", None, json);
         }
+    } else if let Some(endpoint) = args.rpc_url.as_deref()
+        && args.state_file.is_none()
+        && manual_state_clashes(&args).is_empty()
+    {
+        // A read-only live search follows the same proof path a submission would take.
+        // Flag clashes are reported by `resolve_mine_state` below, as before.
+        let chain_id =
+            parse_decimal_uint256(required_live(&args.chain_id, "--chain-id")?, "--chain-id")?;
+        let mining_core = parse_address(
+            required_live(&args.mining_core, "--mining-core")?,
+            "--mining-core",
+        )?;
+        let reader = RpcChainReader::new(endpoint, mining_core, chain_id);
+        match reader.mining_mode(expected_router)? {
+            MiningMode::Paused { resume_at } => return Ok(paused_result(resume_at, json)),
+            MiningMode::Hunt(contracts) => {
+                return run_hunt_search_only(&args, &reader, miner, contracts, json);
+            }
+            MiningMode::Direct => {}
+        }
     }
     let resolved = resolve_mine_state(&args, miner)?;
     let challenge_inputs = resolved.challenge_inputs;
@@ -524,6 +564,7 @@ fn run_mine(args: MineArgs, json: bool) -> Result<RunResult, String> {
     match crate::mining::mine(MiningRequest {
         challenge_inputs,
         miner,
+        floor: None,
         target,
         start_nonce,
         threads,
@@ -644,11 +685,14 @@ fn run_continuous_mine(
         },
     )?;
     let submission = submission.ok_or_else(|| "--loop requires --submit".to_owned())?;
+    let expected_router = parse_router(args.router.as_deref())?;
     let result = crate::continuous::run(
         ContinuousRequest {
             endpoint,
             chain_id,
             mining_core,
+            expected_router,
+            no_upkeep: args.no_upkeep,
             miner,
             basket: submission.basket,
             keystore: submission.keystore,
@@ -679,6 +723,7 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
         args.priority_fee_per_gas.as_deref(),
         args.gas_margin_percent.as_deref(),
     )?;
+    let expected_router = parse_router(args.router.as_deref())?;
     let reader = RpcChainReader::new(&args.rpc_url, mining_core, chain_id);
     reader.verify_identity()?;
     if let Some(recovered) = recover_pending_submission(&reader, &args.keystore)? {
@@ -689,6 +734,54 @@ fn run_submit(args: SubmitArgs, json: bool) -> Result<RunResult, String> {
             recovered.classification_reason,
             json,
         );
+    }
+    match reader.mining_mode(expected_router)? {
+        MiningMode::Paused { resume_at } => return Ok(paused_result(resume_at, json)),
+        MiningMode::Hunt(contracts) => {
+            if let Err(result) = hunt_gate(&reader, contracts, miner, json)? {
+                return Ok(result);
+            }
+            let round = reader.read_hunt_round(contracts, miner)?;
+            let digest = crate::hunt::router_digest(
+                &round.state.challenge_inputs,
+                contracts.router,
+                mining_nonce,
+            );
+            let classification = classify_proof(digest, &round.nft_classification);
+            if !crate::hunt::is_bound_nonce(mining_nonce, miner) {
+                return rejected_submission(
+                    "mining nonce is not bound to this wallet; find it with this version's `mine`"
+                        .to_owned(),
+                    miner,
+                    mining_nonce,
+                    classification,
+                    json,
+                );
+            }
+            if !round.band.contains(digest) {
+                return rejected_submission(
+                    "mining nonce does not satisfy the current target".to_owned(),
+                    miner,
+                    mining_nonce,
+                    classification,
+                    json,
+                );
+            }
+            return complete_claim(
+                &reader,
+                round.state.challenge_inputs,
+                miner,
+                contracts,
+                mining_nonce,
+                basket,
+                &args.keystore,
+                args.passphrase_file.as_deref(),
+                fee_options,
+                classification,
+                json,
+            );
+        }
+        MiningMode::Direct => {}
     }
     let classified_state = reader.read_classified_state(Some(miner))?;
     let state = classified_state.state;
@@ -904,15 +997,24 @@ fn submission_result(
 ) -> Result<RunResult, String> {
     let quote = mined.fee_quote;
     let output = SubmissionOutput {
+        // Router claims only, so v1-path output keeps its exact shape.
+        message: (mined.claimed && mined.succeeded && mined.proof_nft_minted)
+            .then(|| crate::hunt::found_message(mined.nft_token_id)),
         nft_token_id: mined.nft_token_id.map(uint256_to_decimal),
-        status: if !mined.succeeded {
+        status: if mined.upkeep.is_some() {
+            if mined.succeeded {
+                "upkeepSent"
+            } else {
+                "upkeepSkipped"
+            }
+        } else if !mined.succeeded {
             "rejected"
         } else if mined.seed_refresh {
             "seedRefreshed"
         } else {
             "mined"
         },
-        reason: (!mined.succeeded).then(|| {
+        reason: (!mined.succeeded && mined.upkeep.is_none()).then(|| {
             "transaction was mined but reverted; the challenge may have moved before inclusion"
                 .to_owned()
         }),
@@ -1347,6 +1449,403 @@ fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String
     value
         .as_deref()
         .ok_or_else(|| format!("{name} is required unless --state-file is provided"))
+}
+
+// ------------------------------------------------------------------ Mining v2 (router claims)
+
+/// Exit code when nothing was sent because this wallet cannot mine right now.
+pub const NOT_MINING_EXIT_CODE: u8 = 4;
+
+fn parse_router(value: Option<&str>) -> Result<Option<proof_core::Address>, String> {
+    value
+        .map(|value| parse_address(value, "--router"))
+        .transpose()
+}
+
+/// A neutral "nothing was sent" result: not staked, paused, or waiting for the next round.
+fn not_mining_result(
+    status: &'static str,
+    message: String,
+    extra: serde_json::Value,
+    json: bool,
+) -> RunResult {
+    let output = if json {
+        let mut object = serde_json::json!({"status": status, "message": message});
+        if let (Some(object), Some(extra)) = (object.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        object.to_string()
+    } else {
+        format!("status: {status}\nmessage: {message}")
+    };
+    RunResult {
+        output: Zeroizing::new(output),
+        exit_code: NOT_MINING_EXIT_CODE,
+    }
+}
+
+fn paused_result(resume_at: Uint256, json: bool) -> RunResult {
+    not_mining_result(
+        "paused",
+        crate::hunt::pause_message(resume_at),
+        serde_json::json!({"resumeAt": uint256_to_decimal(resume_at)}),
+        json,
+    )
+}
+
+fn not_staked_result(
+    standing: &crate::chain::HuntStanding,
+    wallet: proof_core::Address,
+    json: bool,
+) -> RunResult {
+    not_mining_result(
+        "notStaked",
+        crate::hunt::not_staked_message(standing.unit, wallet),
+        serde_json::json!({
+            "wallet": crate::hunt::checksum_address(wallet),
+            "requiredStakeWei": uint256_to_decimal(standing.unit),
+            "stakedWei": uint256_to_decimal(standing.assigned),
+        }),
+        json,
+    )
+}
+
+fn waiting_result(message: &str, json: bool) -> RunResult {
+    not_mining_result("waiting", message.to_owned(), serde_json::json!({}), json)
+}
+
+/// Checks the wallet's stake; `Some(result)` means stop here without sending anything.
+fn hunt_gate(
+    reader: &RpcChainReader,
+    contracts: HuntContracts,
+    wallet: proof_core::Address,
+    json: bool,
+) -> Result<Result<crate::chain::HuntStanding, RunResult>, String> {
+    let standing = reader.hunt_standing(contracts, wallet)?;
+    if crate::hunt::stake_gate(standing.assigned, standing.unit, standing.mode)
+        == crate::hunt::StakeGate::Needed
+    {
+        return Ok(Err(not_staked_result(&standing, wallet, json)));
+    }
+    Ok(Ok(standing))
+}
+
+/// The neutral answer when a staked wallet cannot submit in the current round.
+fn not_eligible_result(standing: &crate::chain::HuntStanding, json: bool) -> RunResult {
+    if crate::hunt::stake_pending(&standing.preview, standing.assigned, standing.unit) {
+        not_mining_result(
+            "stakePending",
+            crate::hunt::STAKE_PENDING_MESSAGE.to_owned(),
+            serde_json::json!({}),
+            json,
+        )
+    } else {
+        waiting_result(crate::hunt::NOT_THIS_ROUND_MESSAGE, json)
+    }
+}
+
+/// One single-shot Mining v2 run: gate, refresh an expired seed only when the next
+/// round is open, then search the drawn band and claim through the router.
+fn run_hunt_mine(
+    args: &MineArgs,
+    reader: &RpcChainReader,
+    hunter: proof_core::Address,
+    submission: &MineSubmissionConfig,
+    contracts: HuntContracts,
+    json: bool,
+) -> Result<RunResult, String> {
+    let standing = match hunt_gate(reader, contracts, hunter, json)? {
+        Ok(standing) => standing,
+        Err(result) => return Ok(result),
+    };
+    let counter = match &args.start_nonce {
+        Some(value) => parse_nonce(value, "--start-nonce")?,
+        None => Uint256::ZERO,
+    };
+    let start_nonce = crate::hunt::bound_nonce(hunter, counter)?;
+    let marker = reader.read_challenge_marker()?;
+    match marker.status {
+        ChallengeStatus::Ended => return Err("mining has ended; nothing was sent".to_owned()),
+        ChallengeStatus::Stopped => return Err("mining is stopped; nothing was sent".to_owned()),
+        ChallengeStatus::WaitingForSeed => {
+            return Ok(waiting_result(crate::hunt::NOT_THIS_ROUND_MESSAGE, json));
+        }
+        ChallengeStatus::Expired => {
+            if !crate::hunt::refresh_allowed(true, standing.preview.open_at, standing.chain_now) {
+                return Ok(waiting_result(crate::hunt::NOT_THIS_ROUND_MESSAGE, json));
+            }
+            let Some(expired) = reader.expired_seed()? else {
+                return Ok(waiting_result(crate::hunt::NOT_THIS_ROUND_MESSAGE, json));
+            };
+            return refresh_once(reader, hunter, expired, submission, json);
+        }
+        ChallengeStatus::Active => {}
+    }
+    let round = reader.read_hunt_round(contracts, hunter)?;
+    if !crate::hunt::can_submit(&round.standing.preview) {
+        return Ok(not_eligible_result(&round.standing, json));
+    }
+    let threads = parse_threads(args.threads.as_deref())?;
+    let max_attempts = args
+        .max_attempts
+        .as_deref()
+        .map(|value| parse_u64(value, "--max-attempts"))
+        .transpose()?;
+    eprintln!("WARNING: {PROOF_HUNTER_FEE_WARNING}");
+    let challenge_inputs = round.state.challenge_inputs;
+    match crate::mining::mine(MiningRequest {
+        challenge_inputs,
+        miner: contracts.router,
+        floor: round.band.search_floor(),
+        target: round.band.search_target(),
+        start_nonce,
+        threads,
+        max_attempts,
+    })? {
+        MiningResult::Found {
+            mining_nonce,
+            digest,
+            ..
+        } => {
+            if !round.band.contains(digest) || !crate::hunt::is_bound_nonce(mining_nonce, hunter) {
+                return Err("local search returned a proof outside its bounds".to_owned());
+            }
+            let classification = classify_proof(digest, &round.nft_classification);
+            complete_claim(
+                reader,
+                challenge_inputs,
+                hunter,
+                contracts,
+                mining_nonce,
+                submission.basket,
+                &submission.keystore,
+                submission.passphrase_file.as_deref(),
+                submission.fee_options,
+                classification,
+                json,
+            )
+        }
+        MiningResult::Exhausted { attempts, threads } => Ok(RunResult {
+            output: Zeroizing::new(render_mine_exhausted(
+                &MineExhaustedOutput {
+                    found: false,
+                    attempts: attempts.to_string(),
+                    threads: threads.to_string(),
+                    state_source: Some(CHAIN_STATE_SOURCE.to_owned()),
+                },
+                json,
+            )?),
+            exit_code: 1,
+        }),
+        MiningResult::Abandoned { .. } => {
+            Err("single-shot mining was abandoned without an external watcher".to_owned())
+        }
+    }
+}
+
+/// A read-only Mining v2 search: the proof a claim would carry (router as miner, bound nonce).
+fn run_hunt_search_only(
+    args: &MineArgs,
+    reader: &RpcChainReader,
+    hunter: proof_core::Address,
+    contracts: HuntContracts,
+    json: bool,
+) -> Result<RunResult, String> {
+    let counter = match &args.start_nonce {
+        Some(value) => parse_nonce(value, "--start-nonce")?,
+        None => Uint256::ZERO,
+    };
+    let start_nonce = crate::hunt::bound_nonce(hunter, counter)?;
+    let round = reader.read_hunt_round(contracts, hunter)?;
+    let threads = parse_threads(args.threads.as_deref())?;
+    let max_attempts = args
+        .max_attempts
+        .as_deref()
+        .map(|value| parse_u64(value, "--max-attempts"))
+        .transpose()?;
+    let challenge_inputs = round.state.challenge_inputs;
+    let target = round.band.search_target();
+    match crate::mining::mine(MiningRequest {
+        challenge_inputs,
+        miner: contracts.router,
+        floor: round.band.search_floor(),
+        target,
+        start_nonce,
+        threads,
+        max_attempts,
+    })? {
+        MiningResult::Found {
+            mining_nonce,
+            digest,
+            attempts,
+            threads,
+        } => {
+            let classification = classify_proof(digest, &round.nft_classification);
+            let challenge = derive_challenge(&challenge_inputs);
+            let output = MineFoundOutput {
+                proof: VerifyOutput {
+                    chain_id: uint256_to_decimal(challenge_inputs.chain_id),
+                    mining_core: hex_string(&challenge_inputs.mining_core.to_bytes()),
+                    challenge_id: uint256_to_decimal(challenge_inputs.challenge_id),
+                    previous_accepted_digest: hex_string(
+                        &challenge_inputs.previous_accepted_digest.to_bytes(),
+                    ),
+                    seed_parent_block: uint256_to_decimal(challenge_inputs.seed_parent_block),
+                    seed_blockhash: hex_string(&challenge_inputs.seed_blockhash.to_bytes()),
+                    miner: hex_string(&contracts.router.to_bytes()),
+                    nonce: uint256_to_decimal(mining_nonce),
+                    challenge: hex_string(&challenge.to_bytes()),
+                    digest: hex_string(&digest.to_bytes()),
+                    target: hex_string(&target.to_be_bytes()),
+                    accepted: true,
+                },
+                attempts: attempts.to_string(),
+                threads: threads.to_string(),
+                proof_classification: classification.name(),
+                classification_reason: classification.reason().map(str::to_owned),
+                state_source: Some(CHAIN_STATE_SOURCE.to_owned()),
+            };
+            Ok(RunResult {
+                output: Zeroizing::new(render_mine_found(&output, json)?),
+                exit_code: 0,
+            })
+        }
+        MiningResult::Exhausted { attempts, threads } => Ok(RunResult {
+            output: Zeroizing::new(render_mine_exhausted(
+                &MineExhaustedOutput {
+                    found: false,
+                    attempts: attempts.to_string(),
+                    threads: threads.to_string(),
+                    state_source: Some(CHAIN_STATE_SOURCE.to_owned()),
+                },
+                json,
+            )?),
+            exit_code: 1,
+        }),
+        MiningResult::Abandoned { .. } => {
+            Err("single-shot mining was abandoned without an external watcher".to_owned())
+        }
+    }
+}
+
+fn refresh_once(
+    reader: &RpcChainReader,
+    miner: proof_core::Address,
+    expired: (Uint256, Uint256),
+    submission: &MineSubmissionConfig,
+    json: bool,
+) -> Result<RunResult, String> {
+    let (chain_id, mining_core) = reader.deployment();
+    let prepared = match prepare_seed_refresh(
+        reader,
+        chain_id,
+        mining_core,
+        miner,
+        expired,
+        submission.fee_options,
+    )? {
+        PreparationOutcome::Ready(prepared) => *prepared,
+        PreparationOutcome::SimulationRejected { reason } => return Err(reason),
+        PreparationOutcome::FeeRefused(quote) => {
+            return Ok(RunResult {
+                output: Zeroizing::new(if json {
+                    serde_json::json!({"status":"feeRefused", "operation":"seedRefresh", "maximumExposureWei":quote.maximum_exposure_wei.to_string(), "feeCeilingWei":quote.fee_ceiling_wei.to_string()}).to_string()
+                } else {
+                    "Seed refresh refused: maximum exposure exceeds --max-fee".to_owned()
+                }),
+                exit_code: FEE_REFUSAL_EXIT_CODE,
+            });
+        }
+    };
+    let source = submission
+        .passphrase_file
+        .as_deref()
+        .map_or(PassphraseSource::Prompt, PassphraseSource::File);
+    let passphrase = read_passphrase(source, false)?;
+    let wallet = unlock_keystore(&submission.keystore, &passphrase)?;
+    let mined = send_prepared_submission(
+        reader,
+        &wallet,
+        prepared,
+        &submission.keystore,
+        "seedRefresh",
+        None,
+    )?;
+    submission_result(mined, miner, "seedRefresh", None, json)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_claim(
+    reader: &RpcChainReader,
+    challenge_inputs: ChallengeInputs,
+    hunter: proof_core::Address,
+    contracts: HuntContracts,
+    mining_nonce: Uint256,
+    basket: proof_core::Address,
+    keystore: &std::path::Path,
+    passphrase_file: Option<&std::path::Path>,
+    fee_options: FeeOptions,
+    classification: ProofClassification,
+    json: bool,
+) -> Result<RunResult, String> {
+    // Submit only when the wallet would pass right now: no gas on a doomed claim.
+    let standing = reader.hunt_standing(contracts, hunter)?;
+    if !crate::hunt::can_submit(&standing.preview) {
+        return Ok(not_eligible_result(&standing, json));
+    }
+    let route = ClaimRoute {
+        router: contracts.router,
+        nft: contracts.nft,
+    };
+    let prepared = match prepare_claim(
+        reader,
+        challenge_inputs,
+        hunter,
+        route,
+        mining_nonce,
+        basket,
+        fee_options,
+    )? {
+        PreparationOutcome::SimulationRejected { reason } => {
+            return rejected_submission(
+                crate::hunt::neutral_rejection(&reason),
+                hunter,
+                mining_nonce,
+                classification,
+                json,
+            );
+        }
+        PreparationOutcome::FeeRefused(quote) => {
+            return refused_submission(quote, hunter, mining_nonce, classification, json);
+        }
+        PreparationOutcome::Ready(prepared) => *prepared,
+    };
+    if !json {
+        eprintln!("WARNING: {SUBMISSION_WARNING}");
+    }
+    let source = passphrase_file.map_or(PassphraseSource::Prompt, PassphraseSource::File);
+    let passphrase = read_passphrase(source, false)?;
+    let wallet = unlock_keystore(keystore, &passphrase)?;
+    if parse_address(wallet.address(), "unlocked keystore miner address")? != hunter {
+        return Err("unlocked keystore mining address changed after simulation".to_owned());
+    }
+    let mined = send_prepared_submission(
+        reader,
+        &wallet,
+        prepared,
+        keystore,
+        classification.name(),
+        classification.reason(),
+    )?;
+    submission_result(
+        mined,
+        hunter,
+        classification.name(),
+        classification.reason().map(str::to_owned),
+        json,
+    )
 }
 
 fn parse_threads(value: Option<&str>) -> Result<usize, String> {

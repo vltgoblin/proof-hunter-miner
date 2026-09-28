@@ -31,6 +31,31 @@ pub fn search_nonce(
     step: Uint256,
     attempt_budget: u64,
 ) -> SearchResult {
+    search_nonce_above(
+        challenge_inputs,
+        miner,
+        None,
+        target,
+        start_nonce,
+        step,
+        attempt_budget,
+    )
+}
+
+/// Like [`search_nonce`], but a digest must also be strictly greater than
+/// `floor` when one is given: it accepts `floor < digest <= target`.
+///
+/// `None` accepts every digest at or below `target`, including zero.
+#[must_use]
+pub fn search_nonce_above(
+    challenge_inputs: ChallengeInputs,
+    miner: Address,
+    floor: Option<Target>,
+    target: Target,
+    start_nonce: Uint256,
+    step: Uint256,
+    attempt_budget: u64,
+) -> SearchResult {
     let challenge = derive_challenge(&challenge_inputs);
     let prepared = PreparedProof::new(&ProofInputs {
         chain_id: challenge_inputs.chain_id,
@@ -45,7 +70,9 @@ pub fn search_nonce(
     for attempt in 0..attempt_budget {
         let digest = prepared.digest(nonce);
 
-        if meets_target(digest, target) {
+        if meets_target(digest, target)
+            && floor.is_none_or(|floor| digest.to_bytes() > floor.to_be_bytes())
+        {
             return SearchResult::Found {
                 nonce,
                 digest,
@@ -144,6 +171,80 @@ mod tests {
         assert_eq!(
             covered,
             (0_u64..100).map(Uint256::from).collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn floor_skips_digests_at_or_below_it_and_keeps_the_nonce_sequence() {
+        let challenge_inputs = challenge_fixture();
+        let miner = Address::from_bytes([0x11; 20]);
+        let digests: Vec<Digest> = (0_u64..64)
+            .map(|nonce| digest_for(&challenge_inputs, miner, nonce))
+            .collect();
+        // Accept everything, but require a digest above the smallest one: the
+        // first nonce whose digest is above that floor wins, never the floor itself.
+        let smallest = *digests.iter().min().unwrap();
+        let floor = Target::from_be_bytes(smallest.to_bytes());
+        let expected = digests
+            .iter()
+            .position(|digest| *digest > smallest)
+            .unwrap() as u64;
+        assert_eq!(
+            search_nonce_above(
+                challenge_inputs,
+                miner,
+                Some(floor),
+                Target::from_be_bytes([0xff; 32]),
+                Uint256::ZERO,
+                Uint256::ONE,
+                64,
+            ),
+            SearchResult::Found {
+                nonce: Uint256::from(expected),
+                digest: digests[expected as usize],
+                attempts: expected + 1,
+            }
+        );
+        // A band that holds exactly one digest finds exactly that nonce.
+        let mut sorted = digests.clone();
+        sorted.sort();
+        let (below, only) = (sorted[10], sorted[11]);
+        let only_nonce = digests.iter().position(|digest| *digest == only).unwrap() as u64;
+        assert_eq!(
+            search_nonce_above(
+                challenge_inputs,
+                miner,
+                Some(Target::from_be_bytes(below.to_bytes())),
+                Target::from_be_bytes(only.to_bytes()),
+                Uint256::ZERO,
+                Uint256::ONE,
+                64,
+            ),
+            SearchResult::Found {
+                nonce: Uint256::from(only_nonce),
+                digest: only,
+                attempts: only_nonce + 1,
+            }
+        );
+        // No floor behaves exactly like search_nonce.
+        assert_eq!(
+            search_nonce_above(
+                challenge_inputs,
+                miner,
+                None,
+                Target::from_be_bytes(below.to_bytes()),
+                Uint256::ZERO,
+                Uint256::ONE,
+                64,
+            ),
+            search_nonce(
+                challenge_inputs,
+                miner,
+                Target::from_be_bytes(below.to_bytes()),
+                Uint256::ZERO,
+                Uint256::ONE,
+                64,
+            )
         );
     }
 
