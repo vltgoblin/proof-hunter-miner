@@ -21,9 +21,10 @@ use crate::mining::{MiningControl, MiningRequest, MiningResult, mine_with_contro
 use crate::parse::{hex_string, parse_address, uint256_to_decimal};
 use crate::submit::{
     ClaimRoute, FeeOptions, FeeQuote, PROOF_HUNTER_FEE_WARNING, PreparationOutcome,
-    SUBMISSION_WARNING, prepare_claim, prepare_seed_refresh, prepare_submission,
-    recover_pending_submission, send_prepared_submission,
+    SUBMISSION_WARNING, pending_submission_path, prepare_claim, prepare_seed_refresh,
+    prepare_submission, prepare_upkeep, recover_pending_submission, send_prepared_submission,
 };
+use crate::upkeep::{self, Check, Due, Next, UpkeepKind};
 
 pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(1_000);
 const RPC_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -38,6 +39,9 @@ const ROUND_RECHECK: Duration = Duration::from_secs(15);
 const PAUSE_RECHECK: Duration = Duration::from_secs(60);
 /// A refresh waits a random 0..this many ms so miners do not all send it at once.
 const REFRESH_JITTER_MS: u64 = 20_000;
+/// After an upkeep send whose outcome is unknown, wait this long before reconciling
+/// its journal (the network usually settles it meanwhile), and between retries.
+const JOURNAL_RETRY: Duration = Duration::from_secs(300);
 /// Exit code when the loop stops because the wallet is not staked.
 const NOT_STAKED_EXIT_CODE: u8 = 4;
 
@@ -47,6 +51,8 @@ pub struct ContinuousRequest {
     pub mining_core: Address,
     /// Pinned mining router (release profile); otherwise read from the core.
     pub expected_router: Option<Address>,
+    /// Never send network upkeep transactions.
+    pub no_upkeep: bool,
     pub miner: Address,
     pub basket: Address,
     pub keystore: PathBuf,
@@ -231,7 +237,14 @@ enum WatchedMining {
     ChallengeMoved(ChallengeMarker),
     RpcError(String),
     /// The search's recheck deadline passed with the chain unchanged.
-    Recheck,
+    Recheck {
+        attempts: u128,
+    },
+    /// A network upkeep transaction is due; the search stopped after `attempts` hashes.
+    Upkeep {
+        due: Due,
+        attempts: u128,
+    },
 }
 
 /// Runs until interrupted, the contract reaches a terminal state, or a fatal failure occurs.
@@ -284,7 +297,10 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
             if let Err(error) = book.add_fee(recovered.mined.fee_paid_wei) {
                 return fatal(&writer, &book, error, 1);
             }
-            if recovered.mined.succeeded && !recovered.mined.seed_refresh {
+            if recovered.mined.succeeded
+                && !recovered.mined.seed_refresh
+                && recovered.mined.upkeep.is_none()
+            {
                 book.update(|summary| {
                     summary.proofs_accepted += 1;
                     summary.nfts_earned += u64::from(recovered.mined.proof_nft_minted);
@@ -292,7 +308,9 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                 });
             }
             writer.emit(
-                if recovered.mined.seed_refresh {
+                if recovered.mined.upkeep.is_some() {
+                    "upkeepRecovered"
+                } else if recovered.mined.seed_refresh {
                     "seedRefreshRecovered"
                 } else {
                     "submissionRecovered"
@@ -579,7 +597,7 @@ pub fn run(request: ContinuousRequest, json_output: bool) -> Result<ContinuousRe
                     return clean_stop(&writer, &book, "interrupt");
                 }
             }
-            WatchedMining::Recheck => {}
+            WatchedMining::Recheck { .. } | WatchedMining::Upkeep { .. } => {}
             WatchedMining::Mining(MiningResult::Found {
                 mining_nonce,
                 digest,
@@ -820,6 +838,10 @@ struct HuntState {
     resume: Option<(ChallengeMarker, Uint256)>,
     /// The challenge for which pending stake was reported.
     pending_reported: Option<Uint256>,
+    /// Network upkeep bookkeeping, shared with the challenge watcher.
+    upkeep: Arc<Mutex<upkeep::Schedule>>,
+    /// When to next reconcile an upkeep transaction left in the journal.
+    journal_retry_at: Option<Instant>,
 }
 
 struct HuntLoop<'a> {
@@ -849,6 +871,20 @@ impl HuntLoop<'_> {
                     state.stake_checked = Some(Instant::now());
                 }
                 Err(error) => return self.retry(backoff, error),
+            }
+        }
+        // An upkeep transaction left in the journal is reconciled when due; mining
+        // continues meanwhile, and no other transaction is signed until it settles.
+        if pending_submission_path(&self.request.keystore).exists()
+            && state.journal_retry_at.is_none_or(|at| Instant::now() >= at)
+        {
+            match self.resolve_journal() {
+                Ok(()) => state.journal_retry_at = None,
+                Err(error) => {
+                    state.journal_retry_at = Some(Instant::now() + JOURNAL_RETRY);
+                    self.writer
+                        .emit("submissionPending", json!({"reason": error}))?;
+                }
             }
         }
         let marker = match self.reader.read_challenge_marker_with_target() {
@@ -927,6 +963,20 @@ impl HuntLoop<'_> {
         // A wallet that cannot submit on this round keeps hashing, as the app does,
         // but with a target nothing meets, and rechecks the round every few seconds.
         let eligible = hunt::can_submit(&round.standing.preview);
+        let upkeep_watch = upkeep::enabled(
+            self.request.no_upkeep,
+            round.standing.assigned,
+            round.standing.unit,
+        )
+        .then(|| UpkeepWatch {
+            schedule: Arc::clone(&state.upkeep),
+            wallet: self.request.miner,
+            core: self.request.mining_core,
+            router: self.contracts.router,
+            challenge_id: inputs.challenge_id,
+            fresh: round.standing.preview.fresh,
+            journal: pending_submission_path(&self.request.keystore),
+        });
         let spec = if eligible {
             SearchSpec {
                 challenge_inputs: inputs,
@@ -935,6 +985,7 @@ impl HuntLoop<'_> {
                 target: round.band.search_target(),
                 start_nonce,
                 recheck_at: None,
+                upkeep: upkeep_watch,
             }
         } else {
             SearchSpec {
@@ -944,6 +995,7 @@ impl HuntLoop<'_> {
                 target: Target::from_be_bytes([0; 32]),
                 start_nonce,
                 recheck_at: Some(Instant::now() + ROUND_RECHECK),
+                upkeep: upkeep_watch,
             }
         };
         let watched = match watched_search(self.request, spec, current, self.shutdown) {
@@ -965,7 +1017,14 @@ impl HuntLoop<'_> {
                 Ok(None)
             }
             WatchedMining::RpcError(error) => self.retry(backoff, error),
-            WatchedMining::Recheck => Ok(None),
+            WatchedMining::Recheck { attempts } => {
+                state.resume = Some((current, advance(start_nonce, attempts)));
+                Ok(None)
+            }
+            WatchedMining::Upkeep { due, attempts } => {
+                state.resume = Some((current, advance(start_nonce, attempts)));
+                self.run_upkeep(state, due)
+            }
             WatchedMining::Mining(MiningResult::Found {
                 mining_nonce,
                 digest,
@@ -1153,6 +1212,15 @@ impl HuntLoop<'_> {
             router: self.contracts.router,
             nft: self.contracts.nft,
         };
+        // An earlier upkeep still unresolved must settle first: never two transactions
+        // with one account nonce. If it cannot, stop rather than sign past it.
+        if pending_submission_path(&self.request.keystore).exists()
+            && let Err(error) = self.resolve_journal()
+        {
+            self.writer
+                .emit("submissionUnresolved", json!({"reason": error}))?;
+            return failed_stop(self.writer, self.book).map(Some);
+        }
         match prepare_claim(
             self.reader,
             inputs,
@@ -1286,6 +1354,129 @@ impl HuntLoop<'_> {
         }
     }
 
+    /// Sends one due network upkeep through the journaled submit path. It is re-checked
+    /// and simulated again first; any failure only logs a neutral line.
+    fn run_upkeep(&self, state: &mut HuntState, due: Due) -> Step {
+        let journal_pending = pending_submission_path(&self.request.keystore).exists();
+        // Only reached between searches, so no claim is in flight here.
+        if !upkeep::may_send(false, journal_pending) {
+            lock_schedule(&state.upkeep).finish(due, false, 0);
+            return self.upkeep_skipped(due.kind, None);
+        }
+        if due.kind == UpkeepKind::Lock
+            && self.reader.router_fixed(self.contracts.router) != Ok(false)
+        {
+            lock_schedule(&state.upkeep).finish(due, false, 0);
+            return self.upkeep_skipped(due.kind, None);
+        }
+        let prepared = match prepare_upkeep(
+            self.reader,
+            self.request.miner,
+            due.kind,
+            self.contracts.router,
+            self.request.fee_options,
+        ) {
+            Ok(PreparationOutcome::Ready(prepared)) => *prepared,
+            Ok(
+                PreparationOutcome::FeeRefused(_) | PreparationOutcome::SimulationRejected { .. },
+            )
+            | Err(_) => {
+                lock_schedule(&state.upkeep).finish(due, false, 0);
+                return self.upkeep_skipped(due.kind, None);
+            }
+        };
+        let sent = send_prepared_submission(
+            self.reader,
+            self.wallet,
+            prepared,
+            &self.request.keystore,
+            "upkeep",
+            None,
+        );
+        let chain_now = self.reader.latest_timestamp().unwrap_or(0);
+        // Treated as sent either way: an unresolved send is never repeated.
+        lock_schedule(&state.upkeep).finish(due, true, chain_now);
+        if sent.is_err() {
+            state.journal_retry_at = Some(Instant::now() + JOURNAL_RETRY);
+        }
+        match sent {
+            Ok(mined) => {
+                self.book.add_fee(mined.fee_paid_wei)?;
+                if mined.succeeded {
+                    self.writer.emit(
+                        "upkeepSent",
+                        json!({
+                            "kind": due.kind.name(),
+                            "transactionHash": hex_string(&mined.transaction_hash.to_bytes()),
+                            "feePaidWei": mined.fee_paid_wei.to_string(),
+                            "message": upkeep::NEUTRAL_SENT,
+                        }),
+                    )?;
+                    Ok(None)
+                } else {
+                    self.upkeep_skipped(due.kind, Some(&mined))
+                }
+            }
+            Err(_) => self.upkeep_skipped(due.kind, None),
+        }
+    }
+
+    fn upkeep_skipped(
+        &self,
+        kind: UpkeepKind,
+        mined: Option<&crate::submit::MinedSubmission>,
+    ) -> Step {
+        let mut fields = json!({"kind": kind.name(), "message": upkeep::NEUTRAL_SKIPPED});
+        if let Some(mined) = mined {
+            fields["transactionHash"] = json!(hex_string(&mined.transaction_hash.to_bytes()));
+            fields["feePaidWei"] = json!(mined.fee_paid_wei.to_string());
+        }
+        self.writer.emit("upkeepSkipped", fields)?;
+        Ok(None)
+    }
+
+    /// Reconciles the journaled transaction (rebroadcasting the same signed bytes if
+    /// needed); an error means it is still unresolved.
+    fn resolve_journal(&self) -> Result<(), String> {
+        let Some(recovered) = recover_pending_submission(self.reader, &self.request.keystore)?
+        else {
+            return Ok(());
+        };
+        self.book.add_fee(recovered.mined.fee_paid_wei)?;
+        let mined = recovered.mined;
+        if let Some(kind) = mined.upkeep {
+            return self.writer.emit(
+                "upkeepRecovered",
+                json!({
+                    "kind": kind.name(),
+                    "transactionHash": hex_string(&mined.transaction_hash.to_bytes()),
+                    "succeeded": mined.succeeded,
+                    "feePaidWei": mined.fee_paid_wei.to_string(),
+                    "message": upkeep::NEUTRAL_SENT,
+                }),
+            );
+        }
+        if mined.succeeded && !mined.seed_refresh {
+            self.book.update(|summary| {
+                summary.proofs_accepted += 1;
+                summary.nfts_earned += u64::from(mined.proof_nft_minted);
+            });
+        }
+        self.writer.emit(
+            if mined.seed_refresh {
+                "seedRefreshRecovered"
+            } else {
+                "submissionRecovered"
+            },
+            json!({
+                "transactionHash": hex_string(&mined.transaction_hash.to_bytes()),
+                "succeeded": mined.succeeded,
+                "feePaidWei": mined.fee_paid_wei.to_string(),
+                "nftTokenId": mined.nft_token_id.map(uint256_to_decimal),
+            }),
+        )
+    }
+
     fn standing(&self) -> Result<HuntStanding, String> {
         self.reader
             .hunt_standing(self.contracts, self.request.miner)
@@ -1363,6 +1554,80 @@ impl HuntLoop<'_> {
             Ok(None)
         }
     }
+}
+
+/// What the challenge watcher needs to plan network upkeep during one search.
+#[derive(Clone)]
+struct UpkeepWatch {
+    schedule: Arc<Mutex<upkeep::Schedule>>,
+    wallet: Address,
+    core: Address,
+    router: Address,
+    challenge_id: Uint256,
+    fresh: bool,
+    /// The pending-transaction journal: no upkeep is planned while it exists.
+    journal: PathBuf,
+}
+
+impl UpkeepWatch {
+    /// A due upkeep, or none. Runs at most one read-only simulation per call; a
+    /// simulation that would succeed is scheduled after a random 0–30 s delay.
+    fn tick(&self, reader: &RpcChainReader) -> Option<Due> {
+        if self.journal.exists() {
+            return None;
+        }
+        let now = Instant::now();
+        let check = {
+            let mut schedule = lock_schedule(&self.schedule);
+            if let Some(due) = schedule.ready(self.challenge_id, now) {
+                return Some(due);
+            }
+            schedule.next_check(self.challenge_id, self.fresh, now)
+        };
+        let kind = match check? {
+            Check::Lock => {
+                if reader.router_fixed(self.router) != Ok(false) {
+                    return None;
+                }
+                UpkeepKind::Lock
+            }
+            Check::Ease => {
+                let chain_now = reader.latest_timestamp().ok()?;
+                let mut schedule = lock_schedule(&self.schedule);
+                if !upkeep::ease_check_due(
+                    chain_now,
+                    schedule.ease_last_check,
+                    schedule.ease_backoff_until,
+                ) {
+                    return None;
+                }
+                schedule.ease_last_check = Some(chain_now);
+                UpkeepKind::Ease
+            }
+        };
+        let to = match kind {
+            UpkeepKind::Ease => self.core,
+            UpkeepKind::Lock => self.router,
+        };
+        if reader.simulates(self.wallet, to, &kind.call_data()) == Ok(true) {
+            let delay = upkeep::jitter(random_below(u64::MAX));
+            lock_schedule(&self.schedule).schedule(kind, self.challenge_id, now, delay);
+        }
+        None
+    }
+}
+
+fn lock_schedule(
+    schedule: &Mutex<upkeep::Schedule>,
+) -> std::sync::MutexGuard<'_, upkeep::Schedule> {
+    schedule
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The nonce after `attempts` hashes from `start`, to resume a stopped search.
+fn advance(start: Uint256, attempts: u128) -> Uint256 {
+    start.wrapping_add(Uint256::from(attempts))
 }
 
 struct Found {
@@ -1450,6 +1715,7 @@ fn watched_mine(
             target,
             start_nonce: request.start_nonce,
             recheck_at: None,
+            upkeep: None,
         },
         expected,
         shutdown,
@@ -1465,6 +1731,8 @@ struct SearchSpec {
     start_nonce: Uint256,
     /// Stop with `Recheck` at this moment even if the chain has not moved.
     recheck_at: Option<Instant>,
+    /// Network upkeep checks run by the watcher during this search.
+    upkeep: Option<UpkeepWatch>,
 }
 
 /// Searches until a proof, a change of the watched marker, an RPC failure or shutdown.
@@ -1483,6 +1751,7 @@ fn watched_search(
     let watch_target = expected.target.is_some();
     let watch_interval = request.watch_interval;
     let recheck_at = spec.recheck_at;
+    let upkeep_watch = spec.upkeep.clone();
     let watcher_shutdown = Arc::clone(shutdown);
     let watcher = thread::Builder::new()
         .name("bproof-challenge-watcher".to_owned())
@@ -1498,7 +1767,7 @@ fn watched_search(
                 }
                 if recheck_at.is_some_and(|at| Instant::now() >= at) {
                     watcher_control.stop();
-                    return WatchedMining::Recheck;
+                    return WatchedMining::Recheck { attempts: 0 };
                 }
                 let current = if watch_target {
                     reader.read_challenge_marker_with_target()
@@ -1515,6 +1784,12 @@ fn watched_search(
                         watcher_control.stop();
                         return WatchedMining::RpcError(error);
                     }
+                }
+                if let Some(watch) = &upkeep_watch
+                    && let Some(due) = watch.tick(&reader)
+                {
+                    watcher_control.stop();
+                    return WatchedMining::Upkeep { due, attempts: 0 };
                 }
             }
         })
@@ -1538,11 +1813,26 @@ fn watched_search(
         .map_err(|_| "challenge watcher terminated unexpectedly".to_owned())?;
     match watched {
         WatchedMining::ChallengeMoved(_) | WatchedMining::RpcError(_) => Ok(watched),
-        // A proof found in the same moment still wins over the recheck.
-        WatchedMining::Recheck => match mining? {
-            found @ MiningResult::Found { .. } => Ok(WatchedMining::Mining(found)),
-            _ => Ok(WatchedMining::Recheck),
-        },
+        // A proof found in the same moment wins over a recheck or an upkeep: claims first.
+        WatchedMining::Recheck { .. } | WatchedMining::Upkeep { .. } => {
+            let mining = mining?;
+            let attempts = match mining {
+                MiningResult::Found { .. } => 0,
+                MiningResult::Exhausted { attempts, .. }
+                | MiningResult::Abandoned { attempts, .. } => attempts,
+            };
+            let upkeep_due = matches!(watched, WatchedMining::Upkeep { .. });
+            match (
+                upkeep::next_action(matches!(mining, MiningResult::Found { .. }), upkeep_due),
+                watched,
+            ) {
+                (Next::Claim, _) => Ok(WatchedMining::Mining(mining)),
+                (_, WatchedMining::Upkeep { due, .. }) => {
+                    Ok(WatchedMining::Upkeep { due, attempts })
+                }
+                _ => Ok(WatchedMining::Recheck { attempts }),
+            }
+        }
         WatchedMining::Mining(_) => mining.map(WatchedMining::Mining),
     }
 }
@@ -1918,6 +2208,7 @@ mod tests {
             chain_id: challenge_inputs.chain_id,
             mining_core: challenge_inputs.mining_core,
             expected_router: None,
+            no_upkeep: false,
             miner: Address::from_bytes([0x11; 20]),
             basket: Address::from_bytes([0x55; 20]),
             keystore: PathBuf::from("unused"),

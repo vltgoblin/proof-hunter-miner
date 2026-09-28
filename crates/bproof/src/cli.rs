@@ -216,7 +216,7 @@ struct MineArgs {
     /// Continuously read, search, simulate, and submit. Requires --submit.
     #[arg(
         long = "loop",
-        long_help = "Continuously read, search, simulate, and submit. Requires --submit. Expired seeds are automatically refreshed within --max-fee when the next round is open, then mining resumes. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, seedRefreshStarted, seedRefreshed, seedRefreshRecovered, seedRefreshFeeRefused, stakePending, notStaked, miningPaused, rpcRetry, failure, and summary. A wallet that is not staked stops with exit code 4 before anything is sent; a pause waits and resumes by itself. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
+        long_help = "Continuously read, search, simulate, and submit. Requires --submit. Expired seeds are automatically refreshed within --max-fee when the next round is open, then mining resumes. JSON mode streams one object per line. Event kinds: started, challengeUnavailable, challengeChanged, searchStarted, proofFound, staleWorkAbandoned, challengeLost, feeRefused, proofAccepted, seedRefreshStarted, seedRefreshed, seedRefreshRecovered, seedRefreshFeeRefused, stakePending, notStaked, miningPaused, upkeepSent, upkeepSkipped, upkeepRecovered, submissionPending, rpcRetry, failure, and summary. While staked on the upgraded system the loop also sends occasional network upkeep transactions within --max-fee; --no-upkeep turns them off. A wallet that is not staked stops with exit code 4 before anything is sent; a pause waits and resumes by itself. Type `summary` followed by Enter on standard input to request a running summary. Ctrl-C stops cleanly with exit code 0."
     )]
     loop_mode: bool,
     /// Milliseconds between live challenge checks; defaults to 1000.
@@ -237,6 +237,9 @@ struct MineArgs {
     /// Expected mining router address, pinned by the release profile. Without it the router is read from the core.
     #[arg(long)]
     router: Option<String>,
+    /// With --loop: send no network upkeep transactions (sent by default, each within --max-fee).
+    #[arg(long)]
+    no_upkeep: bool,
     /// Override the chain base fee per gas in raw wei.
     #[arg(long)]
     base_fee_per_gas: Option<String>,
@@ -689,6 +692,7 @@ fn run_continuous_mine(
             chain_id,
             mining_core,
             expected_router,
+            no_upkeep: args.no_upkeep,
             miner,
             basket: submission.basket,
             keystore: submission.keystore,
@@ -997,14 +1001,20 @@ fn submission_result(
         message: (mined.claimed && mined.succeeded && mined.proof_nft_minted)
             .then(|| crate::hunt::found_message(mined.nft_token_id)),
         nft_token_id: mined.nft_token_id.map(uint256_to_decimal),
-        status: if !mined.succeeded {
+        status: if mined.upkeep.is_some() {
+            if mined.succeeded {
+                "upkeepSent"
+            } else {
+                "upkeepSkipped"
+            }
+        } else if !mined.succeeded {
             "rejected"
         } else if mined.seed_refresh {
             "seedRefreshed"
         } else {
             "mined"
         },
-        reason: (!mined.succeeded).then(|| {
+        reason: (!mined.succeeded && mined.upkeep.is_none()).then(|| {
             "transaction was mined but reverted; the challenge may have moved before inclusion"
                 .to_owned()
         }),

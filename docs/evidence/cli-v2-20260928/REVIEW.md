@@ -21,14 +21,23 @@ prints the pause notice.
   the CLI wallet; both transactions go from the wallet to the router. Fork-only cheats: the
   core target was made easy, the round start time was moved, and the wallet was made the
   only stake so the run is deterministic.
+- Network upkeep on the fork: on a fresh, unlocked round where the wallet was staked but
+  not selected, `--loop` sent exactly one lock (`fixDraw()` to the router) and one ease
+  (`easeDifficulty()` to the core), each from the wallet after simulation and delay. With
+  easing allowed again and a chain minute passed, it sent nothing more (45-minute back-off).
+  The next round's claim then landed through the router; no other transaction was sent.
 - Scripted-node tests (`tests/hunt_gating.rs`): not staked, not yet allowed to refresh,
   refresh once allowed, staked-but-not-this-round (every refusal reason, one-shot and loop),
   eligible claim with a bound nonce and in-range digest, pause notice, and a router other
-  than the pinned one. Each proves exactly what was or was not broadcast.
+  than the pinned one, upkeep lock and ease broadcasts, and no upkeep with `--no-upkeep` or
+  without stake. Each proves exactly what was or was not broadcast.
 - Unit tests: nonce prefix, router digest, digest ranges against all 64 contract vectors
   (`tests/fixtures/hunt-tier-vectors.json`, byte-identical to the contract copy), submission
   gating, refresh timing, stake gate and message wording, journal v3 round trip and tamper
-  refusal, receipt delivery checks.
+  refusal, receipt delivery checks, and upkeep gating, jitter, back-off, once-per-round,
+  claim priority and one-transaction-at-a-time rules.
+- `cargo audit` 0.22.2 and `cargo deny` 0.20.2 (`check advisories`, this repository's
+  `deny.toml`) report no advisories for `Cargo.lock` (advisory database of 28 Sep 2026).
 - The existing suite, including the live local-contract Anvil tests, passed on Rust 1.90.0;
   clippy (all targets) is clean on 1.90.0. 20 launcher/package tests passed.
 

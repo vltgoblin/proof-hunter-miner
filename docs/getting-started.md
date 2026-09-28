@@ -94,6 +94,13 @@ sending anything exits with code 4 and a plain `status`: `notStaked`, `stakePend
 CLI refuses to mine if the core reports a different one. Without it, the CLI reads the
 router from the core.
 
+While the wallet is staked, `--loop` also sends occasional network upkeep
+transactions, as the app does: each is simulated first, sent after a short random
+delay, stays within `--max-fee`, and never while a proof is being submitted. They
+are logged as `upkeepSent` (with `kind`) or a neutral `upkeepSkipped`, and never stop
+mining. `--no-upkeep` turns them off. One-shot runs, including the launcher, never
+send them.
+
 The native `--loop` option has no total-run spending cap. Do not treat the per-transaction limit as a run-wide budget. Preserve pending journals after crashes or uncertain RPC replies so the CLI can reconcile the exact signed transaction.
 
 ## Agents and the old HUNTER boost

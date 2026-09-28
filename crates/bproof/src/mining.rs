@@ -320,9 +320,33 @@ fn coordinate_batches(
 
         let mut winners = Vec::new();
         for _ in 0..active_workers.len() {
-            let report = reports
-                .recv()
-                .map_err(|_| "a mining worker stopped before reporting its batch".to_owned())?;
+            let report = match reports.recv() {
+                Ok(report) => report,
+                // A stop can land between a batch command and a worker picking it up;
+                // that worker then exits without a report. Keep any proof already in.
+                Err(_) if stop.load(Ordering::Acquire) => {
+                    return Ok(
+                        match winners
+                            .into_iter()
+                            .min_by_key(|winner: &(Uint256, Digest)| winner.0)
+                        {
+                            Some((nonce, digest)) => MiningResult::Found {
+                                mining_nonce: nonce,
+                                digest,
+                                attempts: total_attempts,
+                                threads: configured_threads,
+                            },
+                            None => MiningResult::Abandoned {
+                                attempts: total_attempts,
+                                threads: configured_threads,
+                            },
+                        },
+                    );
+                }
+                Err(_) => {
+                    return Err("a mining worker stopped before reporting its batch".to_owned());
+                }
+            };
             let worker = workers
                 .iter_mut()
                 .find(|worker| worker.worker_id == report.worker_id)

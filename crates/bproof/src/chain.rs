@@ -644,6 +644,44 @@ impl RpcChainReader {
         })
     }
 
+    /// Whether the router's result is already fixed for the current round (`drawFixed()`).
+    pub(crate) fn router_fixed(&self, router: Address) -> Result<bool, String> {
+        let tag = self.string_result("router snapshot block", "eth_blockNumber", json!([]))?;
+        parse_hex_quantity_uint256(&tag, "eth_blockNumber result")?;
+        crate::hunt::decode_bool(
+            &self.contract_bytes(router, "mining router state", "drawFixed()", &[], &tag)?,
+            "mining router state",
+        )
+    }
+
+    /// Simulates a zero-value call from `from` at the latest block: `Ok(false)` when it
+    /// would revert. Transport failures stay errors.
+    pub(crate) fn simulates(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+    ) -> Result<bool, String> {
+        match self.rpc_result(
+            "upkeep simulation",
+            "eth_call",
+            json!([{"from": hex_string(&from.to_bytes()), "to": hex_string(&to.to_bytes()), "data": hex_string(data)}, "latest"]),
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.contains("failed with error") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The latest block's timestamp in seconds: the chain clock upkeep backs off on.
+    pub(crate) fn latest_timestamp(&self) -> Result<u64, String> {
+        let bytes = self.block_timestamp("latest")?.to_be_bytes();
+        if bytes[..24].iter().any(|byte| *byte != 0) {
+            return Err("latest block timestamp exceeds u64".to_owned());
+        }
+        Ok(u64::from_be_bytes(bytes[24..].try_into().expect("8 bytes")))
+    }
+
     fn block_timestamp(&self, tag: &str) -> Result<Uint256, String> {
         let block = self.rpc_result(
             "snapshot block time",

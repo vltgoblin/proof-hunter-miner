@@ -66,6 +66,12 @@ CLI keeps mining and sends nothing. Exit code 4 means nothing was sent: `status`
 `notStaked`, `stakePending`, `waiting` or `paused`. If mining is paused on chain the
 CLI prints the pause notice; `--loop` waits and resumes by itself. The old HUNTER
 boost (MiningPowerCustody) is withdraw-only and no longer affects mining.
+While the wallet is staked, `--loop` also sends occasional network upkeep
+transactions, as the app does: each is simulated first, sent after a short random
+delay, stays within `--max-fee`, and never while a proof is being submitted. They
+are logged as `upkeepSent` (with `kind`) or a neutral `upkeepSkipped`, and never stop
+mining. `--no-upkeep` turns them off. One-shot runs, including the launcher, never
+send them.
 `schedule` and `--state-file` remain legacy offline calculation tools; their token
 schedule is not the current live settlement model.
 

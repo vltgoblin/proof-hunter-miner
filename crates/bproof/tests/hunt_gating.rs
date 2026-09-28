@@ -51,6 +51,10 @@ struct Scenario {
     easy: bool,
     /// The core's module is a pause instead of the stake module.
     paused: bool,
+    /// The router's result is not fixed yet, so `fixDraw()` would succeed.
+    unfixed: bool,
+    /// `easeDifficulty()` would succeed.
+    ease_ok: bool,
 }
 
 impl Scenario {
@@ -74,6 +78,8 @@ fn an_unstaked_wallet_is_told_how_to_stake_and_nothing_is_sent() {
         reason: 4,
         easy: true,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     };
     let fixture = Fixture::new(scenario);
     let output = fixture.mine();
@@ -103,6 +109,8 @@ fn an_expired_round_is_never_refreshed_before_the_next_one_opens() {
         reason: 6,
         easy: false,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     });
     let output = fixture.mine();
     assert_eq!(output.status.code(), Some(4), "{}", describe(&output));
@@ -135,6 +143,8 @@ fn an_expired_round_is_refreshed_once_it_is_open() {
         reason: 6,
         easy: false,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     });
     let output = fixture.mine();
     // The mock refuses the broadcast; what matters is that the refresh was signed and sent.
@@ -156,6 +166,8 @@ fn a_staked_wallet_that_cannot_submit_this_round_sends_nothing() {
             reason,
             easy: true,
             paused: false,
+            unfixed: false,
+            ease_ok: false,
         });
         let output = fixture.mine();
         assert_eq!(
@@ -191,6 +203,8 @@ fn a_staked_wallet_that_cannot_submit_this_round_sends_nothing() {
         reason: 5,
         easy: true,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     });
     let events = fixture.run_loop_until("searchStarted", Duration::from_secs(3));
     assert!(events.iter().any(|event| event["event"] == "searchStarted"));
@@ -212,6 +226,8 @@ fn an_eligible_wallet_claims_a_bound_band_proof_through_the_router() {
         reason: 0,
         easy: true,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     };
     let fixture = Fixture::new(scenario);
     let _ = fixture.mine();
@@ -255,6 +271,8 @@ fn a_pause_module_prints_the_pause_notice_and_sends_nothing() {
         reason: 0,
         easy: true,
         paused: true,
+        unfixed: false,
+        ease_ok: false,
     });
     let output = fixture.mine();
     assert_eq!(output.status.code(), Some(4), "{}", describe(&output));
@@ -281,6 +299,8 @@ fn a_router_other_than_the_pinned_one_refuses_to_mine() {
         reason: 0,
         easy: true,
         paused: false,
+        unfixed: false,
+        ease_ok: false,
     });
     let mut args = fixture.args(false);
     let index = args.iter().position(|arg| arg == "--router").unwrap();
@@ -288,6 +308,91 @@ fn a_router_other_than_the_pinned_one_refuses_to_mine() {
     let output = run(&args);
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to mine"));
+    fixture.node.assert_never_sent();
+}
+
+fn upkeep_scenario(unfixed: bool, ease_ok: bool, assigned: u128) -> Scenario {
+    // Staked, on a fresh round this wallet is not selected for: it keeps hashing
+    // with an impossible target while the watcher plans upkeep.
+    Scenario {
+        state: 1,
+        assigned,
+        open_at: NOW - 60,
+        reason: 5,
+        easy: true,
+        paused: false,
+        unfixed,
+        ease_ok,
+    }
+}
+
+#[test]
+fn a_staked_loop_locks_an_unfixed_round_through_the_journaled_path() {
+    let fixture = Fixture::new(upkeep_scenario(true, false, UNIT));
+    let events = fixture.run_loop_until("upkeepSkipped", Duration::from_millis(200));
+    // Simulated from the wallet first, then signed and broadcast once (the mock refuses
+    // broadcasts, so the CLI logs a neutral skip and keeps mining).
+    let simulations = fixture.node.calls_to(&ROUTER, "fixDraw()");
+    assert!(!simulations.is_empty());
+    assert!(
+        simulations
+            .iter()
+            .all(|call| call.from.as_deref() == Some(fixture.wallet.as_str()))
+    );
+    let broadcasts = fixture.node.broadcasts();
+    assert_eq!(broadcasts.len(), 1, "{broadcasts:?}");
+    assert!(broadcasts[0].contains(&selector_hex("fixDraw()")[2..]));
+    assert!(broadcasts[0].contains(&hex(&ROUTER)[2..]));
+    let skipped = events
+        .iter()
+        .find(|event| event["event"] == "upkeepSkipped")
+        .unwrap();
+    assert_eq!(skipped["kind"], "lock");
+    assert_eq!(skipped["message"], "Network upkeep skipped.");
+    let failures: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == "failure")
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn a_staked_loop_eases_when_the_network_allows_it() {
+    let fixture = Fixture::new(upkeep_scenario(false, true, UNIT));
+    let events = fixture.run_loop_until("upkeepSkipped", Duration::from_millis(200));
+    let broadcasts = fixture.node.broadcasts();
+    assert_eq!(broadcasts.len(), 1, "{broadcasts:?}");
+    assert!(broadcasts[0].contains(&selector_hex("easeDifficulty()")[2..]));
+    assert!(broadcasts[0].contains(&hex(&CORE)[2..]));
+    assert!(
+        !fixture.node.simulated(&ROUTER, "fixDraw()"),
+        "a fixed round is never locked"
+    );
+    let skipped = events
+        .iter()
+        .find(|event| event["event"] == "upkeepSkipped")
+        .unwrap();
+    assert_eq!(skipped["kind"], "ease");
+}
+
+#[test]
+fn no_upkeep_flag_or_missing_stake_means_no_upkeep_at_all() {
+    // --no-upkeep: the loop mines but never simulates or sends upkeep.
+    let fixture = Fixture::new(upkeep_scenario(true, true, UNIT));
+    let mut args = fixture.args(true);
+    args.push("--no-upkeep".into());
+    let events = fixture.run_loop_args_until(args, "searchStarted", Duration::from_secs(4));
+    assert!(events.iter().any(|event| event["event"] == "searchStarted"));
+    assert!(!fixture.node.simulated(&ROUTER, "fixDraw()"));
+    assert!(!fixture.node.simulated(&CORE, "easeDifficulty()"));
+    fixture.node.assert_never_sent();
+
+    // Without its own stake the loop stops before any upkeep, and sends nothing.
+    let fixture = Fixture::new(upkeep_scenario(true, true, UNIT - 1));
+    let output = run(&fixture.args(true));
+    assert_eq!(output.status.code(), Some(4), "{}", describe(&output));
+    assert!(!fixture.node.simulated(&ROUTER, "fixDraw()"));
+    assert!(!fixture.node.simulated(&CORE, "easeDifficulty()"));
     fixture.node.assert_never_sent();
 }
 
@@ -376,8 +481,12 @@ impl Fixture {
     /// Runs `--loop` until an event of `kind` (or 120 s), keeps it running for
     /// `extra` more, then Ctrl-C; returns every JSON event.
     fn run_loop_until(&self, kind: &str, extra: Duration) -> Vec<Value> {
+        self.run_loop_args_until(self.args(true), kind, extra)
+    }
+
+    fn run_loop_args_until(&self, args: Vec<String>, kind: &str, extra: Duration) -> Vec<Value> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bproof"))
-            .args(self.args(true))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -506,6 +615,17 @@ impl MockNode {
     fn simulated(&self, to: &[u8; 20], signature: &str) -> bool {
         !self.calls_to(to, signature).is_empty()
     }
+
+    /// Signed transactions the CLI tried to broadcast, as lowercase hex.
+    fn broadcasts(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.to == "raw")
+            .map(|call| call.data.clone())
+            .collect()
+    }
 }
 
 impl Drop for MockNode {
@@ -573,6 +693,11 @@ fn respond(
         "eth_getTransactionReceipt" => Ok(Value::Null),
         "eth_sendRawTransaction" => {
             sends.fetch_add(1, Ordering::AcqRel);
+            calls.lock().unwrap().push(Call {
+                to: "raw".to_owned(),
+                from: None,
+                data: params[0].as_str().unwrap_or_default().to_lowercase(),
+            });
             Err("mock node does not broadcast".to_owned())
         }
         "eth_call" => {
@@ -621,7 +746,9 @@ fn view(call: &Call, scenario: Scenario) -> Result<String, String> {
             Ok(word(Uint256::from(5_000_u64)))
         } else if is("currentChallenge()") && active {
             Ok(hex(&derive_challenge(&challenge_inputs()).to_bytes()))
-        } else if is("refreshExpiredSeed()") && !active {
+        } else if (is("refreshExpiredSeed()") && !active)
+            || (is("easeDifficulty()") && active && scenario.ease_ok)
+        {
             Ok("0x".to_owned())
         } else {
             Err("execution reverted".to_owned())
@@ -678,14 +805,22 @@ fn view(call: &Call, scenario: Scenario) -> Result<String, String> {
         } else if is("NFT()") {
             Ok(address(&NFT))
         } else if is("drawFixed()") {
-            Ok(word(Uint256::ONE))
+            Ok(word(Uint256::from(u64::from(!scenario.unfixed))))
+        } else if is("fixDraw()") && active && scenario.unfixed {
+            Ok("0x".to_owned())
         } else if is("currentDraw()") {
-            let (low, high) = common_band(scenario.target());
+            // Unfixed, the router reports this challenge's own draw; fixed, Common.
+            let tier = if scenario.unfixed {
+                drawn_tier(derive_challenge(&challenge_inputs()))
+            } else {
+                1
+            };
+            let (low, high) = band_for(scenario.target(), tier);
             Ok(format!(
                 "0x{}{}{}{}{}",
                 &word(Uint256::from(u64::from(active)))[2..],
                 &word(Uint256::from(CHALLENGE_ID))[2..],
-                &word(Uint256::ONE)[2..],
+                &word(Uint256::from(u64::from(tier)))[2..],
                 &word(low)[2..],
                 &word(high)[2..],
             ))
@@ -735,6 +870,58 @@ fn common_band(target: Uint256) -> (Uint256, Uint256) {
     }
     let low: [u8; 32] = quotient[1..].try_into().unwrap();
     (Uint256::from_be_bytes(low), target)
+}
+
+/// The router's draw for `challenge`: keccak256(challenge ‖ keccak256("proof-hunters/tier")) mod 1000.
+fn drawn_tier(challenge: Digest) -> u8 {
+    let mut preimage = [0_u8; 64];
+    preimage[..32].copy_from_slice(&challenge.to_bytes());
+    preimage[32..].copy_from_slice(&keccak256(b"proof-hunters/tier").to_bytes());
+    let draw = keccak256(&preimage)
+        .to_bytes()
+        .iter()
+        .fold(0_u64, |acc, byte| (acc * 256 + u64::from(*byte)) % 1_000);
+    match draw {
+        0..10 => 4,
+        10..80 => 3,
+        80..300 => 2,
+        _ => 1,
+    }
+}
+
+/// floor(target * numerator / 1000), exactly.
+fn per_mille(target: Uint256, numerator: u64) -> Uint256 {
+    let bytes = target.to_be_bytes();
+    let mut wide = [0_u8; 40];
+    let mut carry = 0_u128;
+    for index in (0..32).rev() {
+        let product = u128::from(bytes[index]) * u128::from(numerator) + carry;
+        wide[index + 8] = product as u8;
+        carry = product >> 8;
+    }
+    wide[..8].copy_from_slice(&(carry as u64).to_be_bytes());
+    let mut remainder = 0_u128;
+    for byte in &mut wide {
+        let partial = (remainder << 8) | u128::from(*byte);
+        *byte = (partial / 1_000) as u8;
+        remainder = partial % 1_000;
+    }
+    Uint256::from_be_bytes(wide[8..].try_into().unwrap())
+}
+
+/// The router's band for `tier` at `target`: (low, high].
+fn band_for(target: Uint256, tier: u8) -> (Uint256, Uint256) {
+    let (legendary, rare, uncommon) = (
+        per_mille(target, 10),
+        per_mille(target, 80),
+        per_mille(target, 300),
+    );
+    match tier {
+        4 => (Uint256::ZERO, legendary),
+        3 => (legendary, rare),
+        2 => (rare, uncommon),
+        _ => (uncommon, target),
+    }
 }
 
 // ------------------------------------------------------------------ helpers

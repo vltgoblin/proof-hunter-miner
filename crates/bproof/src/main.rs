@@ -10,6 +10,7 @@ mod output;
 mod parse;
 mod power;
 mod submit;
+mod upkeep;
 
 use std::process::ExitCode;
 
