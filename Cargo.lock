@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "bproof"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "bip32",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "proof-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sha3",
 ]

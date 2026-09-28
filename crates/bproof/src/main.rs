@@ -4,6 +4,7 @@ mod chain;
 mod classification;
 mod cli;
 mod continuous;
+mod hunt;
 mod mining;
 mod output;
 mod parse;

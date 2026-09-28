@@ -22,4 +22,4 @@ pub use schedule::{
     FINAL_DIVISOR, MAX_MINTED_EVER, MIN_REWARD, OPENING_DIVISOR, RAMP_PROOFS, RewardSchedule,
     TOKEN_WEI, divisor_at, reserve_for, reward_at,
 };
-pub use search::{SearchResult, search_nonce};
+pub use search::{SearchResult, search_nonce, search_nonce_above};

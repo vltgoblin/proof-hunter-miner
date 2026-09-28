@@ -1,8 +1,9 @@
 # Proof Hunters network launcher
 
 Requires Python 3.9+ and the native `bproof` binary included in the release bundle.
-Mainnet is live on chain 4663. The v0.2.3 bundles pin each platform binary and the
-deployed contract bytecode. Source templates remain disabled; testnet is disabled.
+Mainnet is live on chain 4663. The v0.3.0 bundles pin each platform binary and the
+deployed contract bytecode: the mining core, basket, stake module and mining router.
+Source templates remain disabled; testnet is disabled.
 
 ## Commands
 
@@ -14,6 +15,8 @@ deployed contract bytecode. Source templates remain disabled; testnet is disable
 
 The fee above is a syntax example, not a recommended budget. The limit is per
 transaction. Each call submits at most one proof, never an unbounded mining loop.
+Stake 1M HUNTER tokens to the CLI wallet in the app (app.proofhunter.fun/app/mine)
+first. An unstaked wallet sends nothing and exits with code 4 and that instruction.
 Use `bproof wallet new --help` to create a dedicated encrypted wallet. Never put
 private keys or passphrases in profiles or command arguments. Do not delete a
 pending transaction journal to retry a transfer.
@@ -21,7 +24,9 @@ pending transaction journal to retry a transfer.
 ## Mainnet protocol is live; package activation remains separate
 
 `profiles/mainnet.json` records chain 4663, the live mining core, admitted NVDA
-basket and SHA-256 hashes of decoded runtime bytecode. Its `ready` flag stays
+basket, stake module and mining router, and SHA-256 hashes of their decoded runtime
+bytecode. `mine` passes the pinned router to `bproof --router`, which refuses to
+mine if the core reports a different one. Its `ready` flag stays
 false and `binarySha256` stays empty until a matching current binary is packaged
 and verified. This is a CLI distribution limit, not a mainnet launch gate.
 The old v0.1.0 binary must not be used to fill this gap.
