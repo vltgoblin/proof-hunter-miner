@@ -1,6 +1,7 @@
 # Verify a miner release
 
-**Mainnet:** chain 4663. Use v0.2.3 for NFT mining; v0.1.0 is legacy.
+**Mainnet:** chain 4663. Use v0.3.0 for NFT mining; v0.2.3 cannot mine since the
+28 Sep 2026 upgrade, and v0.1.0 is legacy.
 Download from the exact release tag and verify the files below before execution.
 If that release is not published yet, use a reviewed source build instead.
 

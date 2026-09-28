@@ -7,7 +7,9 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-use proof_core::{Address, ChallengeInputs, Digest, SearchResult, Target, Uint256, search_nonce};
+use proof_core::{
+    Address, ChallengeInputs, Digest, SearchResult, Target, Uint256, search_nonce_above,
+};
 
 // Keep cancellation responsive without forcing every worker through the
 // coordinator after only a few hundred hashes.  The smaller batch left most
@@ -40,6 +42,8 @@ impl MiningControl {
 pub struct MiningRequest {
     pub challenge_inputs: ChallengeInputs,
     pub miner: Address,
+    /// Exclusive lower bound: when set, a digest must also be above it.
+    pub floor: Option<Target>,
     pub target: Target,
     pub start_nonce: Uint256,
     pub threads: usize,
@@ -86,6 +90,7 @@ struct WorkerContext {
     step: Uint256,
     challenge_inputs: ChallengeInputs,
     miner: Address,
+    floor: Option<Target>,
     target: Target,
     stop: Arc<AtomicBool>,
     reports: Sender<WorkerReport>,
@@ -123,9 +128,10 @@ pub fn mine_with_control(
         });
     }
 
-    let first = search_nonce(
+    let first = search_nonce_above(
         request.challenge_inputs,
         request.miner,
+        request.floor,
         request.target,
         request.start_nonce,
         step,
@@ -187,6 +193,7 @@ pub fn mine_with_control(
                 step,
                 challenge_inputs: request.challenge_inputs,
                 miner: request.miner,
+                floor: request.floor,
                 target: request.target,
                 stop: Arc::clone(&stop),
                 reports: reports_tx.clone(),
@@ -245,9 +252,10 @@ fn worker_loop(
 
         match commands.recv() {
             Ok(WorkerCommand::Search(budget)) => {
-                let result = search_nonce(
+                let result = search_nonce_above(
                     context.challenge_inputs,
                     context.miner,
+                    context.floor,
                     context.target,
                     next_nonce,
                     context.step,
@@ -414,6 +422,7 @@ mod tests {
             MiningRequest {
                 challenge_inputs: challenge(1),
                 miner: Address::from_bytes([0x11; 20]),
+                floor: None,
                 target: Target::from_be_bytes([0; 32]),
                 start_nonce: Uint256::ZERO,
                 threads: 2,
@@ -428,6 +437,7 @@ mod tests {
         let current = mine(MiningRequest {
             challenge_inputs: challenge(2),
             miner: Address::from_bytes([0x11; 20]),
+            floor: None,
             target: Target::from_be_bytes([0xff; 32]),
             start_nonce: Uint256::ZERO,
             threads: 2,

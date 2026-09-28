@@ -37,7 +37,8 @@ account nonce and restores the same encrypted wallet.
 
 Receipt acceptance requires the current core's `ProofAccepted` and exactly one
 matching `ProofNftMinted` event, consistent with the transaction, miner, challenge,
-proof digest and requested basket. RPC data remains a trust source.
+proof digest and requested basket; a router submission must also deliver the Hunter
+NFT to the mining wallet in the same transaction. RPC data remains a trust source.
 
 Before broadcast, the CLI writes an owner-only durable journal beside the
 keystore containing the exact signed transaction and the public verification
@@ -47,14 +48,26 @@ receipt before allowing a new transaction. Corrupt, overly permissive, or
 inconsistent journal state fails closed. Never delete a pending journal merely
 to bypass this guard; reconcile its transaction first.
 
-Live mining and submission automatically use the core-selected Mining Power module's
-challenge-bound multiplier for the mining wallet. The HUNTER must be locked and assigned to that exact address in MiningPowerCustody;
-new assignments apply from the next challenge. The current app assignment shortcut
-selects its browser mining wallet, so it does not assign to a different CLI wallet.
-Loose token balances do not boost mining. No assigned power means 1x.
-Continuous search events report the base target, effective target and multiplier.
-A failed power read pauses live search rather than silently guessing a multiplier. `schedule` and `--state-file` remain legacy offline
-calculation tools; their token schedule is not the current live settlement model.
+A wallet must be staked to mine. Stake **1M HUNTER tokens** to the CLI wallet's
+address in the app (app.proofhunter.fun/app/mine); `bproof wallet address` prints
+it. The CLI never stakes, approves or assigns tokens. Before it unlocks the keystore
+or sends anything, `mine --submit` checks the wallet's stake; an unstaked wallet
+stops with exit code 4 and a plain instruction:
+
+```text
+Not staked: Stake 1M HUNTER tokens to this wallet in the app: app.proofhunter.fun/app/mine (your CLI wallet address: 0x…).
+```
+
+The CLI reads the current mining contracts from the core and submits proofs through
+the mining router, sent by the mining wallet itself. `--router` pins the router
+address from the release profile (the launcher passes it). A proof is submitted only
+when the chain says it would be accepted for this wallet right now; otherwise the
+CLI keeps mining and sends nothing. Exit code 4 means nothing was sent: `status` is
+`notStaked`, `stakePending`, `waiting` or `paused`. If mining is paused on chain the
+CLI prints the pause notice; `--loop` waits and resumes by itself. The old HUNTER
+boost (MiningPowerCustody) is withdraw-only and no longer affects mining.
+`schedule` and `--state-file` remain legacy offline calculation tools; their token
+schedule is not the current live settlement model.
 
 See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
@@ -62,7 +75,7 @@ See [wallet funding and gas limits](docs/getting-started.md) for the setup flow.
 
 The network launcher in [distribution](distribution/README.md) defaults to testnet.
 The mainnet protocol is live and its public addresses/runtime hashes are recorded
-in the mainnet profile. Source profile templates stay disabled. The v0.2.3 release bundles contain a
+in the mainnet profile. Source profile templates stay disabled. The v0.3.0 release bundles contain a
 matching binary and a mainnet profile pinned to that binary. Testnet stays disabled.
 Mainnet mining through a released launcher requires explicit confirmation.
 
@@ -78,16 +91,16 @@ Install the public [Proof Hunters Agent Skills](https://github.com/vltgoblin/pro
 npx skills add vltgoblin/proof-hunters-skills --skill proof-hunters-mining
 ```
 
-It uses verified v0.2.3 bundles, bounded mining calls, explicit gas budgets,
-assigned HUNTER power, and automatic seed refresh. Start with a read-only status
+It uses verified v0.3.0 bundles, bounded mining calls, explicit gas budgets,
+stake checks, and automatic seed refresh. Start with a read-only status
 check. Installing the skill does not authorize transactions. A matching copy is
 included at [agent-skills/proof-hunters-mining](agent-skills/proof-hunters-mining/SKILL.md).
 
 ## Release status
 
-**Mainnet: live on Robinhood Chain (4663).** [Download v0.2.3](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.2.3), including assigned HUNTER mining power.
-Verify download checksums and build attestations before use. The older **v0.1.0 is
-legacy** and must not be used for mainnet NFT mining.
+**Mainnet: live on Robinhood Chain (4663).** [Download v0.3.0](https://github.com/vltgoblin/proof-hunter-miner/releases/tag/v0.3.0) for the mining system upgraded on 28 Sep 2026; see the [changelog](CHANGELOG.md).
+Verify download checksums and build attestations before use. **v0.2.3 cannot mine since
+the upgrade**, and **v0.1.0 is legacy**; do not use either for mainnet NFT mining.
 
 Each `proof-hunters-<system>.zip` includes the binary, Python 3.9+ launcher and
 mainnet configuration. The raw `bproof-*` files are also available for users who
@@ -118,10 +131,11 @@ promise equal wins per device. The browser remains a valid mining path.
 
 ## Automatic seed refresh
 
-Expired seeds are refreshed automatically when `mine --submit` is authorized.
-A one-shot run sends only the refresh, reports `seedRefreshed`, and exits; invoke
-it again after the seed becomes readable to mine. With `--loop`, the miner waits
-for the new seed and resumes itself. Read-only commands never refresh or spend.
+An expired round is refreshed automatically when `mine --submit` is authorized and the
+network allows the next round; until then the CLI waits and sends nothing. A one-shot
+run sends only the refresh, reports `seedRefreshed`, and exits; invoke it again after
+the seed becomes readable to mine. With `--loop`, the miner waits for the new seed and
+resumes itself. Read-only commands never refresh or spend.
 The refresh uses the same per-transaction `--max-fee` ceiling, has zero ETH value,
 and mints no NFT. Another miner can win the refresh race; a reverted transaction
 can still cost gas. Refresh fees are included in the loop's total fees.
@@ -129,5 +143,5 @@ can still cost gas. Refresh fees are included in the loop's total fees.
 An unresolved refresh is journaled before broadcast and reconciled on restart.
 If the seed changed and no receipt is available, recovery refuses to rebroadcast
 stale refresh bytes and keeps the journal for investigation. Never clear it to
-force another transaction. Version 2 journals support proof and refresh calls;
-existing version 1 proof journals remain readable.
+force another transaction. v0.3.0 writes version 3 journals for router submissions;
+version 1 and 2 journals remain readable. Do not downgrade while a journal is pending.

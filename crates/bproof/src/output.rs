@@ -92,6 +92,8 @@ pub struct StatusOutput {
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nft_token_id: Option<String>,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,6 +307,9 @@ pub fn render_submission(value: &SubmissionOutput, json: bool) -> Result<String,
     }
     if let Some(id) = &value.nft_token_id {
         output.push_str(&format!("\nnftTokenId: {id}"));
+    }
+    if let Some(message) = &value.message {
+        output.push_str(&format!("\nmessage: {message}"));
     }
     if let Some(reason) = &value.reason {
         output.push_str(&format!("\nreason: {reason}"));

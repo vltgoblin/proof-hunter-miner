@@ -33,7 +33,7 @@ pub fn effective_target(
 
 // A 320-bit temporary holds uint256 * uint64 without truncation. Long division
 // keeps a remainder smaller than a uint64; both inner operations fit in u128.
-fn mul_div(value: [u8; 32], factor: u64, divisor: u64) -> Result<[u8; 32], String> {
+pub(crate) fn mul_div(value: [u8; 32], factor: u64, divisor: u64) -> Result<[u8; 32], String> {
     let mut wide = [0_u8; 40];
     let mut carry = 0_u128;
     for i in (0..32).rev() {

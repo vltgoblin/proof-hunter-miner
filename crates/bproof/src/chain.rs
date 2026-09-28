@@ -72,6 +72,47 @@ pub struct ChallengeMarker {
     pub previous_accepted_digest: Digest,
     pub challenge: Option<Digest>,
     pub status: ChallengeStatus,
+    /// The core's current target; read only when the search depends on it (Mining v2).
+    pub target: Option<Target>,
+}
+
+/// Which proof path the core's current Mining Power module asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiningMode {
+    /// No module, or a module that is neither HuntStake nor a pause: proofs go to the core (v1).
+    Direct,
+    /// A pause module that refuses every proof until `resume_at` (unix seconds).
+    Paused { resume_at: Uint256 },
+    /// HuntStake (Mining v2): proofs go through its HuntRouter.
+    Hunt(HuntContracts),
+}
+
+/// The Mining v2 contracts, cross-checked against the core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HuntContracts {
+    pub stake: Address,
+    pub router: Address,
+    pub nft: Address,
+}
+
+/// One wallet's standing with HuntStake, read at one block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HuntStanding {
+    pub unit: Uint256,
+    pub assigned: Uint256,
+    pub mode: u8,
+    pub preview: crate::hunt::Preview,
+    /// Timestamp of the block the standing was read at: the only clock the refresh rule trusts.
+    pub chain_now: Uint256,
+}
+
+/// Everything a Mining v2 search needs, read at one verified block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HuntRound {
+    pub state: MiningState,
+    pub band: crate::hunt::Band,
+    pub standing: HuntStanding,
+    pub nft_classification: Result<NftClassificationSnapshot, String>,
 }
 
 /// Supplies a complete mining-state snapshot from one explicit source.
@@ -227,8 +268,18 @@ impl RpcChainReader {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("missing error message");
+            // Revert data names the contract error even when the message does not.
+            let data = error
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| {
+                    data.len() <= 2 + 2 * 1_024
+                        && data.starts_with("0x")
+                        && data[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map_or_else(String::new, |data| format!(" (revert data {data})"));
             return Err(format!(
-                "JSON-RPC {operation} failed with error {code}: {message}"
+                "JSON-RPC {operation} failed with error {code}: {message}{data}"
             ));
         }
 
@@ -346,11 +397,25 @@ impl RpcChainReader {
         )))
     }
 
+    /// The expected chain ID and the core this reader is bound to.
+    pub(crate) fn deployment(&self) -> (Uint256, Address) {
+        (self.expected_chain_id, self.mining_core_address)
+    }
+
     pub(crate) fn matches_deployment(&self, chain_id: Uint256, core: Address) -> bool {
         chain_id == self.expected_chain_id && core == self.mining_core_address
     }
 
     pub(crate) fn read_challenge_marker(&self) -> Result<ChallengeMarker, String> {
+        self.read_marker(false)
+    }
+
+    /// The marker plus the core's current target, which moves a Mining v2 search band.
+    pub(crate) fn read_challenge_marker_with_target(&self) -> Result<ChallengeMarker, String> {
+        self.read_marker(true)
+    }
+
+    fn read_marker(&self, include_target: bool) -> Result<ChallengeMarker, String> {
         let block_tag =
             self.string_result("watcher snapshot block", "eth_blockNumber", json!([]))?;
         parse_hex_quantity_uint256(&block_tag, "eth_blockNumber watcher result")?;
@@ -368,12 +433,291 @@ impl RpcChainReader {
         } else {
             None
         };
+        let target = if include_target {
+            Some(Target::from_be_bytes(
+                self.call_word("currentTarget()", &block_tag)?.to_be_bytes(),
+            ))
+        } else {
+            None
+        };
         Ok(ChallengeMarker {
             challenge_id,
             previous_accepted_digest,
             challenge,
             status,
+            target,
         })
+    }
+
+    // ------------------------------------------------------------------ Mining v2
+
+    /// Which proof path the core's module asks for, read at a verified block.
+    ///
+    /// HuntStake is recognised by its router: the module's `ROUTER()` must name a
+    /// router whose `MODULE()` is this module and whose `CORE()` is this core, and
+    /// the router's `NFT()` must be the core's `PROOF_NFT()`. With `expected_router`
+    /// (a pinned release profile) any other router is refused. A module without a
+    /// router keeps v1 behaviour; a pause module reports its end time.
+    pub(crate) fn mining_mode(
+        &self,
+        expected_router: Option<Address>,
+    ) -> Result<MiningMode, String> {
+        let tag = self.verified_block_tag()?;
+        self.mining_mode_at(&tag, expected_router)
+    }
+
+    fn mining_mode_at(
+        &self,
+        tag: &str,
+        expected_router: Option<Address>,
+    ) -> Result<MiningMode, String> {
+        let module = word_address(
+            self.call_word("miningPower()", tag)?,
+            "MiningCore.miningPower()",
+        )?;
+        if module == Address::from_bytes([0; 20]) {
+            return Ok(MiningMode::Direct);
+        }
+        let router = match self.probe_word(module, "ROUTER()", tag)? {
+            Some(word) => word_address(word, "stake module router").ok(),
+            None => None,
+        };
+        let Some(router) = router.filter(|router| *router != Address::from_bytes([0; 20])) else {
+            return self.pause_or_direct(module, tag);
+        };
+        if let Some(expected) = expected_router
+            && expected != router
+        {
+            return Err(format!(
+                "the core's mining module uses router {}, not the pinned --router {}; refusing to mine until the release settings are updated",
+                hex_string(&router.to_bytes()),
+                hex_string(&expected.to_bytes())
+            ));
+        }
+        let router_module = word_address(
+            self.contract_word(router, "mining router wiring", "MODULE()", tag)?,
+            "mining router wiring",
+        )?;
+        let router_core = word_address(
+            self.contract_word(router, "mining router wiring", "CORE()", tag)?,
+            "mining router wiring",
+        )?;
+        if router_module != module || router_core != self.mining_core_address {
+            return Err(
+                "the mining module's router is not wired to this core and module; refusing to mine"
+                    .to_owned(),
+            );
+        }
+        let nft = word_address(
+            self.contract_word(router, "mining router wiring", "NFT()", tag)?,
+            "mining router wiring",
+        )?;
+        let core_nft = word_address(
+            self.call_word("PROOF_NFT()", tag)?,
+            "MiningCore.PROOF_NFT()",
+        )?;
+        if nft != core_nft {
+            return Err(
+                "the mining router's NFT is not the core's Hunter NFT; refusing to mine".to_owned(),
+            );
+        }
+        Ok(MiningMode::Hunt(HuntContracts {
+            stake: module,
+            router,
+            nft,
+        }))
+    }
+
+    fn pause_or_direct(&self, module: Address, tag: &str) -> Result<MiningMode, String> {
+        let Some(paused) = self.probe_word(module, "paused()", tag)? else {
+            return Ok(MiningMode::Direct);
+        };
+        if paused != Uint256::ONE {
+            return Ok(MiningMode::Direct);
+        }
+        match self.probe_word(module, "RESUME_AT()", tag)? {
+            Some(resume_at) => Ok(MiningMode::Paused { resume_at }),
+            None => Ok(MiningMode::Direct),
+        }
+    }
+
+    /// `wallet`'s stake, HuntStake mode and preview, with the block's timestamp.
+    pub(crate) fn hunt_standing(
+        &self,
+        contracts: HuntContracts,
+        wallet: Address,
+    ) -> Result<HuntStanding, String> {
+        let tag =
+            self.string_result("stake module snapshot block", "eth_blockNumber", json!([]))?;
+        parse_hex_quantity_uint256(&tag, "eth_blockNumber result")?;
+        self.hunt_standing_at(&tag, contracts, wallet)
+    }
+
+    fn hunt_standing_at(
+        &self,
+        tag: &str,
+        contracts: HuntContracts,
+        wallet: Address,
+    ) -> Result<HuntStanding, String> {
+        let stake = contracts.stake;
+        let unit = self.contract_word(stake, "stake module unit", "unit()", tag)?;
+        let assigned = self.contract_word_with(
+            stake,
+            "stake module stake",
+            "assignedOf(address)",
+            &[crate::hunt::address_word(wallet)],
+            tag,
+        )?;
+        let mode_word = self.contract_word(stake, "stake module mode", "mode()", tag)?;
+        let mode_bytes = mode_word.to_be_bytes();
+        if mode_bytes[..31].iter().any(|byte| *byte != 0) || mode_bytes[31] > 2 {
+            return Err("stake module mode is out of range".to_owned());
+        }
+        let preview = crate::hunt::decode_preview(&self.contract_bytes(
+            stake,
+            "stake module standing",
+            "preview(address)",
+            &[crate::hunt::address_word(wallet)],
+            tag,
+        )?)?;
+        Ok(HuntStanding {
+            unit,
+            assigned,
+            mode: mode_bytes[31],
+            preview,
+            chain_now: self.block_timestamp(tag)?,
+        })
+    }
+
+    /// The state, band and wallet standing for an active challenge, all at one verified block.
+    /// The router's band is cross-checked against the locally computed band at the core's target.
+    pub(crate) fn read_hunt_round(
+        &self,
+        contracts: HuntContracts,
+        wallet: Address,
+    ) -> Result<HuntRound, String> {
+        let tag = self.verified_block_tag()?;
+        let state = self.read_state_at(&tag)?;
+        let draw = crate::hunt::decode_draw(&self.contract_bytes(
+            contracts.router,
+            "mining router state",
+            "currentDraw()",
+            &[],
+            &tag,
+        )?)?;
+        if !draw.active || draw.challenge_id != state.challenge_inputs.challenge_id {
+            return Err(format!(
+                "challenge unavailable: the router has no active round for challenge {}",
+                uint256_to_decimal(state.challenge_inputs.challenge_id)
+            ));
+        }
+        let expected = crate::hunt::Band::at(state.target, draw.band.tier);
+        if expected != Some(draw.band) {
+            return Err(
+                "mining router state disagrees with the core target; refusing to mine".to_owned(),
+            );
+        }
+        // Until it is fixed for later rounds, the band is this challenge's own draw.
+        let fixed = crate::hunt::decode_bool(
+            &self.contract_bytes(
+                contracts.router,
+                "mining router state",
+                "drawFixed()",
+                &[],
+                &tag,
+            )?,
+            "mining router state",
+        )?;
+        if !fixed && crate::hunt::drawn_tier(state.challenge) != draw.band.tier {
+            return Err(
+                "mining router state disagrees with the local derivation; refusing to mine"
+                    .to_owned(),
+            );
+        }
+        let standing = self.hunt_standing_at(&tag, contracts, wallet)?;
+        let nft_classification = self.read_nft_classification_at(&tag, state.target);
+        Ok(HuntRound {
+            state,
+            band: draw.band,
+            standing,
+            nft_classification,
+        })
+    }
+
+    fn block_timestamp(&self, tag: &str) -> Result<Uint256, String> {
+        let block = self.rpc_result(
+            "snapshot block time",
+            "eth_getBlockByNumber",
+            json!([tag, false]),
+        )?;
+        let timestamp = block
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "snapshot block has no timestamp".to_owned())?;
+        parse_hex_quantity_uint256(timestamp, "snapshot block timestamp")
+    }
+
+    fn contract_word(
+        &self,
+        to: Address,
+        operation: &str,
+        signature: &str,
+        tag: &str,
+    ) -> Result<Uint256, String> {
+        self.contract_word_with(to, operation, signature, &[], tag)
+    }
+
+    fn contract_word_with(
+        &self,
+        to: Address,
+        operation: &str,
+        signature: &str,
+        arguments: &[[u8; 32]],
+        tag: &str,
+    ) -> Result<Uint256, String> {
+        let bytes = self.contract_bytes(to, operation, signature, arguments, tag)?;
+        let word: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("{operation} return value must be exactly 32 bytes"))?;
+        Ok(Uint256::from_be_bytes(word))
+    }
+
+    fn contract_bytes(
+        &self,
+        to: Address,
+        operation: &str,
+        signature: &str,
+        arguments: &[[u8; 32]],
+        tag: &str,
+    ) -> Result<Vec<u8>, String> {
+        let mut data = crate::hunt::selector(signature).to_vec();
+        for argument in arguments {
+            data.extend_from_slice(argument);
+        }
+        let result = self.string_result(
+            operation,
+            "eth_call",
+            json!([{"to": hex_string(&to.to_bytes()), "data": hex_string(&data)}, tag]),
+        )?;
+        crate::parse::parse_hex_bytes(&result, &format!("{operation} return value"))
+    }
+
+    /// One word from an optional view: `None` when the contract reverts or returns
+    /// something other than one word (it does not have that view). Transport errors propagate.
+    fn probe_word(
+        &self,
+        to: Address,
+        signature: &str,
+        tag: &str,
+    ) -> Result<Option<Uint256>, String> {
+        match self.contract_bytes(to, signature, signature, &[], tag) {
+            Ok(bytes) => Ok(<[u8; 32]>::try_from(bytes.as_slice())
+                .ok()
+                .map(Uint256::from_be_bytes)),
+            Err(error) if error.contains("failed with error") => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn read_classified_state(
@@ -568,6 +912,11 @@ fn validate_contract_code(code: &str) -> Result<(), String> {
         return Err("eth_getCode result contains malformed bytecode".to_owned());
     }
     Ok(())
+}
+
+fn word_address(value: Uint256, name: &str) -> Result<Address, String> {
+    crate::hunt::word_address(value.to_be_bytes())
+        .ok_or_else(|| format!("{name} returned a malformed address"))
 }
 
 fn uint256_to_u128(value: Uint256, name: &str) -> Result<u128, String> {
