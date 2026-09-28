@@ -35,8 +35,11 @@ const EASY_TARGET: &str = "0x0ffffffffffffffffffffffffffffffffffffffffffffffffff
 /// HuntStake storage: slot 1 `totalAssigned`, slot 20 `_openAt` (forge inspect storageLayout).
 const STAKE_TOTAL_ASSIGNED_SLOT: &str = "0x1";
 const STAKE_OPEN_AT_SLOT: &str = "0x14";
-/// HunterMiningCore storage slot 4 is `currentTarget`.
+/// HunterMiningCore storage: slot 4 `currentTarget`, slot 10 `lastEaseBlock`.
 const CORE_TARGET_SLOT: &str = "0x4";
+const CORE_LAST_EASE_SLOT: &str = "0xa";
+/// HuntRouter storage slot 0 is the `fixedTier` mapping (uint256 => uint8).
+const ROUTER_FIXED_TIER_SLOT: u8 = 0;
 /// The HUNTER token keeps balances in mapping slot 0.
 const TOKEN_BALANCES_SLOT: u8 = 0;
 
@@ -159,22 +162,100 @@ fn mainnet_fork_claims_through_the_router_and_never_spends_unstaked() {
         expired_id
     );
 
-    // ---- 4. Open the round; the loop refreshes it, then claims through the router.
+    // ---- 4. Open the round. The loop refreshes it; this first fresh round selects
+    // someone else (the wallet holds a negligible share of all stake), so the loop keeps
+    // mining and sends network upkeep: it locks the unfixed round and eases once.
     chain.rpc("evm_increaseTime", json!([700]));
     chain.rpc("anvil_mine", json!(["0x1"]));
-    // Make this wallet the round's only stake so it is certain to be selected.
-    chain.set_storage(&stake, STAKE_TOTAL_ASSIGNED_SLOT, &word_hex(UNIT_WEI));
+    chain.set_storage(
+        &stake,
+        STAKE_TOTAL_ASSIGNED_SLOT,
+        &word_hex(10_u128.pow(38)),
+    );
+    // Mainnet may already have locked the current round; unlock it on the fork.
+    let minted = chain.uint_call(CORE, "nftsMintedEver()", &[]);
+    chain.set_storage(
+        &router,
+        &uint_mapping_slot(minted, ROUTER_FIXED_TIER_SLOT),
+        "0x0",
+    );
     let mut miner_loop = LoopProcess::start(&mine_args(&chain, &miner, &passphrase, None, true));
     let refresh = miner_loop.wait_for(&["seedRefreshed"], Duration::from_secs(120));
     assert_eq!(refresh["event"], "seedRefreshed", "{refresh}");
+    let upkeep_round = expired_id + 1;
     assert_eq!(
         chain.uint_call(CORE, "activeChallengeId()", &[]),
-        expired_id + 1
+        upkeep_round
     );
     assert!(
         chain.uint_call(&stake, "challengeOpenedAt()", &[])
             >= chain.uint_call(&stake, "openAt()", &[])
     );
+    chain.rpc("anvil_mine", json!(["0x4"]));
+    assert_eq!(
+        chain.uint_call(&router, "drawFixed()", &[]),
+        0,
+        "round starts unlocked"
+    );
+    let nonce_before_upkeep = chain.nonce(&miner.address);
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let sent = miner_loop.wait_for(&["upkeepSent"], Duration::from_secs(180));
+        assert_eq!(sent["message"], "Network upkeep transaction sent.");
+        let hash = sent["transactionHash"].as_str().unwrap();
+        let transaction = chain.rpc("eth_getTransactionByHash", json!([hash]));
+        assert_eq!(
+            transaction["from"].as_str().unwrap().to_lowercase(),
+            miner.address
+        );
+        let (to, signature) = match sent["kind"].as_str().unwrap() {
+            "lock" => (router.as_str(), "fixDraw()"),
+            "ease" => (CORE, "easeDifficulty()"),
+            other => panic!("unexpected upkeep kind {other}"),
+        };
+        assert_eq!(transaction["to"].as_str().unwrap().to_lowercase(), to);
+        assert_eq!(
+            transaction["input"].as_str().unwrap(),
+            selector_hex(signature)
+        );
+        kinds.push(sent["kind"].as_str().unwrap().to_owned());
+    }
+    kinds.sort();
+    assert_eq!(kinds, ["ease", "lock"]);
+    assert_eq!(
+        chain.uint_call(&router, "drawFixed()", &[]),
+        1,
+        "the loop locked the round"
+    );
+    assert_eq!(
+        chain.call(CORE, "currentTarget()", &[]),
+        chain.call(CORE, "MAX_TARGET()", &[]),
+        "the loop eased"
+    );
+    assert_eq!(chain.nonce(&miner.address), nonce_before_upkeep + 2);
+
+    // ---- 5. Back-off: easing is allowed again and a chain minute has passed, but the
+    // loop sends nothing more while it backs off (45 minutes of chain time).
+    chain.set_storage(CORE, CORE_TARGET_SLOT, EASY_TARGET);
+    chain.set_storage(CORE, CORE_LAST_EASE_SLOT, "0x0");
+    chain.rpc("evm_increaseTime", json!([120]));
+    chain.rpc("anvil_mine", json!(["0x1"]));
+    assert!(
+        chain.simulates(&miner.address, CORE, "easeDifficulty()"),
+        "easing is allowed again"
+    );
+    let quiet = miner_loop.events_for(Duration::from_secs(100));
+    assert!(
+        quiet.iter().all(|event| event["event"] != "upkeepSent"),
+        "upkeep during back-off: {quiet:#?}"
+    );
+    assert_eq!(chain.nonce(&miner.address), nonce_before_upkeep + 2);
+
+    // ---- 6. The next fresh round selects this wallet (its only stake): the claim still
+    // lands through the router, with no further upkeep.
+    chain.set_storage(&stake, STAKE_TOTAL_ASSIGNED_SLOT, &word_hex(UNIT_WEI));
+    expire_round(&chain);
+    miner_loop.wait_for(&["seedRefreshed"], Duration::from_secs(120));
     chain.rpc("anvil_mine", json!(["0x4"]));
     let accepted = miner_loop.wait_for(&["proofAccepted"], Duration::from_secs(300));
     let token_id: u128 = accepted["nftTokenId"].as_str().unwrap().parse().unwrap();
@@ -185,15 +266,27 @@ fn mainnet_fork_claims_through_the_router_and_never_spends_unstaked() {
             .starts_with("Hunter NFT found")
     );
     assert_claimed_to(&chain, &accepted, &miner.address, &router, &nft, token_id);
+    // Upkeep 2 + refresh 1 + claim 1 since the upkeep round began.
+    assert_eq!(chain.nonce(&miner.address), nonce_before_upkeep + 4);
     let summary = miner_loop.interrupt();
     assert_eq!(summary.0, Some(0), "loop did not stop cleanly");
     assert!(
         summary.1.iter().all(|event| event["event"] != "proofFound"
-            || event["challengeId"].as_str() == Some(&(expired_id + 1).to_string())),
+            || event["challengeId"].as_str() == Some(&(upkeep_round + 1).to_string())),
         "the loop submitted on a round it could not claim"
     );
+    assert_eq!(
+        summary
+            .1
+            .iter()
+            .filter(|event| event["event"] == "upkeepSent" && event["kind"] == "ease")
+            .count(),
+        1,
+        "eased more than once"
+    );
 
-    // ---- 5. The next round: single-shot refresh, then a single-shot claim.
+    // ---- 7. The next round: single-shot refresh, then a single-shot claim (single-shot
+    // runs never send upkeep).
     let open_at = chain.uint_call(&stake, "openAt()", &[]);
     let wait = u64::try_from(open_at)
         .unwrap()
@@ -444,6 +537,20 @@ impl LoopProcess {
         panic!("no {kinds:?} event; events so far: {:#?}", self.seen);
     }
 
+    /// Every event that arrives within `duration`.
+    fn events_for(&mut self, duration: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + duration;
+        let mut events = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(event) = self.events.recv_timeout(left) {
+                assert_ne!(event["event"], "notStaked", "{event}");
+                self.seen.push(event.clone());
+                events.push(event);
+            }
+        }
+        events
+    }
+
     /// Ctrl-C, then the exit code and every event.
     fn interrupt(mut self) -> (Option<i32>, Vec<Value>) {
         let _ = Command::new("kill")
@@ -585,6 +692,23 @@ impl Chain {
         format!("0x{}", &word.trim_start_matches("0x")[24..64]).to_lowercase()
     }
 
+    /// Whether a zero-value call from `from` would succeed at the latest block.
+    fn simulates(&self, from: &str, to: &str, signature: &str) -> bool {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{"from": from, "to": to, "data": selector_hex(signature)}, "latest"]});
+        let text = ureq::post(&self.url)
+            .content_type("application/json")
+            .send(body.to_string().as_bytes())
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        serde_json::from_str::<Value>(&text)
+            .unwrap()
+            .get("error")
+            .is_none()
+    }
+
     fn set_storage(&self, contract: &str, slot: &str, value: &str) {
         let slot = format!("0x{:0>64}", slot.trim_start_matches("0x"));
         let value = format!("0x{:0>64}", value.trim_start_matches("0x"));
@@ -671,6 +795,13 @@ fn mapping_slot(key: &str, slot: u8) -> String {
     for (index, chunk) in key.as_bytes().chunks(2).enumerate() {
         preimage[12 + index] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
     }
+    preimage[63] = slot;
+    hex(&keccak256(&preimage).to_bytes())
+}
+
+fn uint_mapping_slot(key: u128, slot: u8) -> String {
+    let mut preimage = [0_u8; 64];
+    preimage[16..32].copy_from_slice(&key.to_be_bytes());
     preimage[63] = slot;
     hex(&keccak256(&preimage).to_bytes())
 }

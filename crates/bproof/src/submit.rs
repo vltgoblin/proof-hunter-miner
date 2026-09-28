@@ -19,6 +19,7 @@ use crate::parse::{
     hex_string, parse_address, parse_decimal_uint256, parse_digest, parse_hex_bytes,
     parse_hex_quantity_uint256, parse_u64, parse_u128, parse_uint256_word, uint256_to_decimal,
 };
+use crate::upkeep::UpkeepKind;
 
 pub const FEE_REFUSAL_EXIT_CODE: u8 = 3;
 pub const SUBMISSION_WARNING: &str = "Another miner may consume this challenge before inclusion, and this transaction may fail. Receipt success is accepted only after transaction and event consistency checks; the configured RPC can still withhold or delay data and remains a trust source.";
@@ -74,6 +75,8 @@ pub struct PreparedSubmission {
     /// The mining core, which emits the proof events.
     core: Address,
     claim: Option<ClaimRoute>,
+    /// Network upkeep (`easeDifficulty()` or `fixDraw()`): no proof, no NFT.
+    upkeep: Option<UpkeepKind>,
     challenge_id: Uint256,
     seed_parent_block: Uint256,
     challenge: Digest,
@@ -92,6 +95,7 @@ impl std::fmt::Debug for PreparedSubmission {
             .field("miner", &self.miner)
             .field("core", &self.core)
             .field("claim", &self.claim)
+            .field("upkeep", &self.upkeep)
             .field("challenge_id", &self.challenge_id)
             .field("seed_parent_block", &self.seed_parent_block)
             .field("challenge", &self.challenge)
@@ -113,6 +117,7 @@ pub struct MinedSubmission {
     pub seed_refresh: bool,
     /// A Mining v2 router claim (the proof path of the upgraded system).
     pub claimed: bool,
+    pub upkeep: Option<UpkeepKind>,
     pub transaction_hash: Digest,
     pub mining_nonce: Uint256,
     pub account_nonce: Uint256,
@@ -145,6 +150,9 @@ struct PendingSubmissionDocument {
     /// Version 3 claims: the Hunter NFT the router forwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hunter_nft: Option<String>,
+    /// Version 3 network upkeep: `ease` or `lock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upkeep: Option<String>,
     version: u8,
     transaction_hash: String,
     raw_transaction: String,
@@ -173,7 +181,8 @@ struct PendingSubmissionDocument {
 }
 
 const PENDING_SUBMISSION_VERSION: u8 = 2;
-/// Written for router claims only, so v1-path journals stay readable by older releases.
+/// Written for router claims and network upkeep only, so v1-path journals stay
+/// readable by older releases.
 const PENDING_CLAIM_VERSION: u8 = 3;
 
 pub fn prepare_submission(
@@ -254,6 +263,28 @@ pub fn prepare_claim(
         prepared.challenge = challenge;
         prepared.expected_digest = expected_digest;
         prepared.basket = basket;
+    }
+    Ok(outcome)
+}
+
+/// Prepares one network upkeep call from `wallet`: `easeDifficulty()` on the core or
+/// `fixDraw()` on the router. The existing simulation, gas estimate and fee ceiling apply.
+pub fn prepare_upkeep(
+    reader: &RpcChainReader,
+    wallet: Address,
+    kind: UpkeepKind,
+    router: Address,
+    fee_options: FeeOptions,
+) -> Result<PreparationOutcome, String> {
+    let (chain_id, core) = reader.deployment();
+    let to = match kind {
+        UpkeepKind::Ease => core,
+        UpkeepKind::Lock => router,
+    };
+    let mut outcome = prepare_call(reader, chain_id, to, wallet, kind.call_data(), fee_options)?;
+    if let PreparationOutcome::Ready(prepared) = &mut outcome {
+        prepared.core = core;
+        prepared.upkeep = Some(kind);
     }
     Ok(outcome)
 }
@@ -366,6 +397,7 @@ fn prepare_call(
         miner,
         core: to,
         claim: None,
+        upkeep: None,
         challenge_id: Uint256::ZERO,
         seed_parent_block: Uint256::ZERO,
         challenge: Digest::from_bytes([0; 32]),
@@ -510,18 +542,20 @@ impl PendingSubmissionDocument {
     ) -> Self {
         let fee = prepared.fee_quote;
         let tx = &prepared.transaction;
+        let v3 = prepared.claim.is_some() || prepared.upkeep.is_some();
         Self {
             seed_refresh: prepared.seed_refresh,
-            core: prepared
-                .claim
-                .map(|_| hex_string(&prepared.core.to_bytes())),
-            router: prepared
-                .claim
-                .map(|route| hex_string(&route.router.to_bytes())),
+            core: v3.then(|| hex_string(&prepared.core.to_bytes())),
+            router: match (prepared.claim, prepared.upkeep) {
+                (Some(route), _) => Some(hex_string(&route.router.to_bytes())),
+                (None, Some(UpkeepKind::Lock)) => Some(hex_string(&tx.to.to_bytes())),
+                _ => None,
+            },
             hunter_nft: prepared
                 .claim
                 .map(|route| hex_string(&route.nft.to_bytes())),
-            version: if prepared.claim.is_some() {
+            upkeep: prepared.upkeep.map(|kind| kind.name().to_owned()),
+            version: if v3 {
                 PENDING_CLAIM_VERSION
             } else {
                 PENDING_SUBMISSION_VERSION
@@ -563,22 +597,31 @@ impl PendingSubmissionDocument {
         if self.version == 1 && self.seed_refresh {
             return Err("legacy proof journal cannot describe a seed refresh".to_owned());
         }
-        let claim_fields = [&self.core, &self.router, &self.hunter_nft];
-        if self.version < PENDING_CLAIM_VERSION && claim_fields.iter().any(|field| field.is_some())
-        {
+        let v3_fields = [&self.core, &self.router, &self.hunter_nft, &self.upkeep];
+        if self.version < PENDING_CLAIM_VERSION && v3_fields.iter().any(|field| field.is_some()) {
             return Err(
                 "pending submission journal has claim fields in an older version".to_owned(),
             );
         }
-        if self.version == PENDING_CLAIM_VERSION
-            && (claim_fields.iter().any(|field| field.is_none()) || self.seed_refresh)
-        {
-            return Err("pending claim journal is missing its core, router or NFT".to_owned());
+        let upkeep = self
+            .upkeep
+            .as_deref()
+            .map(UpkeepKind::from_name)
+            .transpose()?;
+        if self.version == PENDING_CLAIM_VERSION {
+            let complete = match upkeep {
+                None => self.router.is_some() && self.hunter_nft.is_some(),
+                Some(UpkeepKind::Ease) => self.router.is_none() && self.hunter_nft.is_none(),
+                Some(UpkeepKind::Lock) => self.router.is_some() && self.hunter_nft.is_none(),
+            };
+            if self.core.is_none() || !complete || self.seed_refresh {
+                return Err("pending claim journal is missing its core, router or NFT".to_owned());
+            }
         }
         let transaction_hash = parse_digest(&self.transaction_hash, "journal transactionHash")?;
         let raw_transaction = parse_hex_bytes(&self.raw_transaction, "journal rawTransaction")?;
         let claim = match (&self.router, &self.hunter_nft) {
-            (Some(router), Some(nft)) => Some(ClaimRoute {
+            (Some(router), Some(nft)) if upkeep.is_none() => Some(ClaimRoute {
                 router: parse_address(router, "journal router")?,
                 nft: parse_address(nft, "journal hunterNft")?,
             }),
@@ -616,6 +659,7 @@ impl PendingSubmissionDocument {
             miner: parse_address(&self.miner, "journal miner")?,
             core,
             claim,
+            upkeep,
             challenge_id: parse_decimal_uint256(&self.challenge_id, "journal challengeId")?,
             seed_parent_block: parse_decimal_uint256(
                 &self.seed_parent_block,
@@ -645,6 +689,20 @@ impl PendingSubmissionDocument {
         }
         if let Some(route) = prepared.claim {
             validate_claim_journal(&prepared, route)?;
+        }
+        if let Some(kind) = prepared.upkeep {
+            let expected_to = match kind {
+                UpkeepKind::Ease => prepared.core,
+                UpkeepKind::Lock => match &self.router {
+                    Some(router) => parse_address(router, "journal router")?,
+                    None => return Err("upkeep journal is missing its router".to_owned()),
+                },
+            };
+            if prepared.transaction.data != kind.call_data()
+                || prepared.transaction.to != expected_to
+            {
+                return Err("upkeep journal has invalid calldata".to_owned());
+            }
         }
         if prepared.transaction.account_nonce != prepared.account_nonce {
             return Err(
@@ -696,6 +754,7 @@ fn mined_submission(
     Ok(MinedSubmission {
         seed_refresh: prepared.seed_refresh,
         claimed: prepared.claim.is_some(),
+        upkeep: prepared.upkeep,
         transaction_hash,
         mining_nonce: prepared.mining_nonce,
         account_nonce: prepared.account_nonce,
@@ -1012,7 +1071,8 @@ fn parse_receipt(
         .and_then(Value::as_array)
         .ok_or_else(|| "proof transaction receipt is missing `logs`".to_owned())?;
     let succeeded = status == Uint256::ONE;
-    if succeeded && !prepared.seed_refresh {
+    let proof = !prepared.seed_refresh && prepared.upkeep.is_none();
+    if succeeded && proof {
         verify_proof_accepted_event(logs, transaction_hash, block_hash, block_number, prepared)?;
     }
     let nft_token_id =
@@ -1041,6 +1101,19 @@ fn parse_receipt(
         if proof_nft_minted {
             return Err("seed refresh must not mint an NFT".to_owned());
         }
+    } else if let Some(kind) = prepared.upkeep {
+        if proof_nft_minted {
+            return Err("network upkeep must not mint an NFT".to_owned());
+        }
+        verify_upkeep_event(
+            logs,
+            transaction_hash,
+            block_hash,
+            block_number,
+            prepared,
+            kind,
+            succeeded,
+        )?;
     } else if succeeded != proof_nft_minted {
         return Err("HunterMiningCore success requires exactly one NFT mint; reverted receipts must not mint".to_owned());
     }
@@ -1134,7 +1207,7 @@ fn verify_mined_transaction(
         &prepared.transaction.data,
     )?;
 
-    if prepared.seed_refresh {
+    if prepared.seed_refresh || prepared.upkeep.is_some() {
         let block = reader.rpc_result(
             "canonical refresh block",
             "eth_getBlockByNumber",
@@ -1169,6 +1242,51 @@ fn require_current_expired_seed(
             "expired seed changed; refusing a stale refresh (any pending journal is retained)"
                 .to_owned(),
         );
+    }
+    Ok(())
+}
+
+/// A successful upkeep receipt carries exactly its own event: `DifficultyEased` from the
+/// core naming this wallet, or `DrawFixed` from the router. A reverted one carries none.
+fn verify_upkeep_event(
+    logs: &[Value],
+    hash: Digest,
+    block_hash: Digest,
+    block_number: Uint256,
+    prepared: &PreparedSubmission,
+    kind: UpkeepKind,
+    succeeded: bool,
+) -> Result<(), String> {
+    let (signature, name, topics) = match kind {
+        UpkeepKind::Ease => (
+            event_signature(b"DifficultyEased(address,uint256,uint256,uint256)"),
+            "upkeep ease event",
+            2,
+        ),
+        UpkeepKind::Lock => (
+            event_signature(b"DrawFixed(uint256,uint8,uint256)"),
+            "upkeep lock event",
+            2,
+        ),
+    };
+    let events = event_candidates(logs, signature)?;
+    if events.len() != usize::from(succeeded) {
+        return Err("upkeep receipt has an inconsistent event count".to_owned());
+    }
+    if !succeeded {
+        return Ok(());
+    }
+    let fields = event_fields(
+        events[0],
+        name,
+        hash,
+        block_hash,
+        block_number,
+        prepared.transaction.to,
+    )?;
+    let topics = event_topics(fields, name, topics)?;
+    if kind == UpkeepKind::Ease {
+        require_topic_address(topics, 1, "upkeep ease caller", prepared.miner)?;
     }
     Ok(())
 }
@@ -2062,6 +2180,7 @@ mod tests {
             miner,
             core: mining_core,
             claim: None,
+            upkeep: None,
             challenge_id,
             seed_parent_block,
             challenge,
@@ -2300,6 +2419,97 @@ mod tests {
         let mut as_wallet = accepted;
         as_wallet["topics"][1] = json!(address_topic(prepared.miner));
         assert!(parse_receipt(&receipt(vec![as_wallet]), hash, &prepared).is_err());
+    }
+
+    fn upkeep_fixture(kind: UpkeepKind) -> PreparedSubmission {
+        let mut prepared = prepared_fixture();
+        let router = Address::from_bytes([0x7e; 20]);
+        prepared.upkeep = Some(kind);
+        prepared.transaction.to = match kind {
+            UpkeepKind::Ease => prepared.core,
+            UpkeepKind::Lock => router,
+        };
+        prepared.transaction.data = kind.call_data();
+        prepared
+    }
+
+    #[test]
+    fn upkeep_journals_round_trip_and_refuse_foreign_calldata() {
+        for kind in [UpkeepKind::Ease, UpkeepKind::Lock] {
+            let prepared = upkeep_fixture(kind);
+            let document = PendingSubmissionDocument::from_prepared(
+                Digest::ZERO,
+                "0x02",
+                &prepared,
+                "upkeep",
+                None,
+            );
+            assert_eq!(document.version, PENDING_CLAIM_VERSION);
+            assert_eq!(document.upkeep.as_deref(), Some(kind.name()));
+            let (_, _, restored) = document.to_prepared().unwrap();
+            assert_eq!(restored.upkeep, Some(kind));
+            assert!(restored.claim.is_none());
+            assert_eq!(restored.transaction.to, prepared.transaction.to);
+
+            let mut tampered = serde_json::to_value(&document).unwrap();
+            tampered["data"] = json!(hex_string(&refresh_call_data()));
+            let tampered: PendingSubmissionDocument = serde_json::from_value(tampered).unwrap();
+            assert!(tampered.to_prepared().unwrap_err().contains("upkeep"));
+        }
+        let mut unknown = serde_json::to_value(PendingSubmissionDocument::from_prepared(
+            Digest::ZERO,
+            "0x02",
+            &upkeep_fixture(UpkeepKind::Ease),
+            "upkeep",
+            None,
+        ))
+        .unwrap();
+        unknown["upkeep"] = json!("draw");
+        let unknown: PendingSubmissionDocument = serde_json::from_value(unknown).unwrap();
+        assert!(unknown.to_prepared().is_err());
+    }
+
+    #[test]
+    fn an_upkeep_receipt_needs_its_own_event_and_never_mints() {
+        let prepared = upkeep_fixture(UpkeepKind::Ease);
+        let hash = Digest::from_bytes([0x77; 32]);
+        let block_hash = Digest::from_bytes([0x88; 32]);
+        let eased = json!({
+            "address": hex_string(&prepared.core.to_bytes()),
+            "transactionHash": hex_string(&hash.to_bytes()),
+            "blockHash": hex_string(&block_hash.to_bytes()),
+            "blockNumber": "0x15",
+            "removed": false,
+            "topics": [
+                hex_string(&event_signature(b"DifficultyEased(address,uint256,uint256,uint256)").to_bytes()),
+                address_topic(prepared.miner),
+            ],
+            "data": abi_data(&[[1; 32], [2; 32], [3; 32]]),
+        });
+        let receipt = |logs: Vec<Value>, status: &str| {
+            json!({
+                "transactionHash": hex_string(&hash.to_bytes()),
+                "from": hex_string(&prepared.miner.to_bytes()),
+                "to": hex_string(&prepared.core.to_bytes()),
+                "blockHash": hex_string(&block_hash.to_bytes()),
+                "blockNumber": "0x15",
+                "status": status,
+                "gasUsed": "0x5208",
+                "effectiveGasPrice": "0x2",
+                "logs": logs,
+            })
+        };
+        let parsed = parse_receipt(&receipt(vec![eased.clone()], "0x1"), hash, &prepared).unwrap();
+        assert!(parsed.succeeded && !parsed.proof_nft_minted);
+        assert!(parse_receipt(&receipt(vec![], "0x1"), hash, &prepared).is_err());
+        assert!(
+            !parse_receipt(&receipt(vec![], "0x0"), hash, &prepared)
+                .unwrap()
+                .succeeded
+        );
+        let mut other_caller = eased;
+        other_caller["topics"][1] = json!(address_topic(Address::from_bytes([0x66; 20])));
+        assert!(parse_receipt(&receipt(vec![other_caller], "0x1"), hash, &prepared).is_err());
     }
 
     fn address_topic(address: Address) -> String {
